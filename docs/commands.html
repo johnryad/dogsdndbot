@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Памятка игрока</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@600;700&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@600&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #14110f;
+    --panel: #1e1915;
+    --line: #3a2f25;
+    --gold: #d9a95b;
+    --gold-soft: #b8894a;
+    --blood: #b5452f;
+    --text: #efe6d8;
+    --muted: #a8998a;
+    --cmd-bg: #2b221a;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    width: 1080px;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Inter", "Segoe UI", sans-serif;
+  }
+  .page {
+    margin: 28px;
+    padding: 44px 48px 36px;
+    border: 2px solid var(--line);
+    border-radius: 18px;
+    background:
+      radial-gradient(ellipse at top, rgba(217, 169, 91, 0.12), transparent 60%),
+      radial-gradient(ellipse at bottom, rgba(181, 69, 47, 0.10), transparent 55%),
+      var(--panel);
+    position: relative;
+  }
+  .page::before {
+    content: "";
+    position: absolute; inset: 10px;
+    border: 1px solid rgba(217, 169, 91, 0.22);
+    border-radius: 12px;
+    pointer-events: none;
+  }
+  header { display: flex; align-items: center; gap: 26px; margin-bottom: 30px; }
+  header svg { flex: none; }
+  h1 {
+    font-family: "Cormorant Garamond", Georgia, serif;
+    font-size: 60px; line-height: 1; color: var(--gold); letter-spacing: 0.5px;
+  }
+  .sub { margin-top: 10px; font-size: 21px; color: var(--muted); }
+  .sub b { color: var(--text); font-weight: 600; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  section {
+    background: rgba(0, 0, 0, 0.22);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    padding: 22px 24px 18px;
+  }
+  section.wide { grid-column: span 2; }
+  h2 {
+    font-family: "Cormorant Garamond", Georgia, serif;
+    font-size: 31px; color: var(--gold); margin-bottom: 14px;
+    display: flex; align-items: center; gap: 10px;
+  }
+  h2 .n {
+    font-family: "Inter", sans-serif; font-size: 15px; font-weight: 700;
+    color: var(--bg); background: var(--gold); border-radius: 50%;
+    width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center;
+  }
+  .row { display: flex; gap: 14px; align-items: baseline; padding: 7px 0; font-size: 19px; line-height: 1.35; }
+  .row + .row { border-top: 1px dashed rgba(217, 169, 91, 0.14); }
+  code {
+    font-family: "JetBrains Mono", Consolas, monospace; font-size: 18px;
+    color: var(--gold); background: var(--cmd-bg);
+    border: 1px solid #4a3a2a; border-radius: 7px; padding: 3px 9px;
+    white-space: nowrap; flex: none;
+  }
+  .row span { color: var(--text); }
+  .row em { color: var(--muted); font-style: normal; }
+  .wide .cols { display: grid; grid-template-columns: 1fr 1fr; column-gap: 30px; }
+  .note {
+    margin-top: 12px; padding: 12px 16px; border-radius: 10px;
+    background: rgba(181, 69, 47, 0.14); border-left: 4px solid var(--blood);
+    font-size: 18px; color: var(--text); line-height: 1.4;
+  }
+  .steps { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 6px; }
+  .step {
+    font-size: 16px; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 999px; padding: 5px 13px;
+  }
+  .step b { color: var(--gold); }
+  footer {
+    margin-top: 26px; text-align: center;
+    font-family: "Cormorant Garamond", Georgia, serif; font-style: italic;
+    font-size: 24px; color: var(--muted);
+  }
+</style>
+</head>
+<body>
+<div class="page">
+  <header>
+    <svg width="118" height="118" viewBox="0 0 100 100" aria-hidden="true">
+      <polygon points="50,4 92,28 92,72 50,96 8,72 8,28" fill="#2b221a" stroke="#d9a95b" stroke-width="3"/>
+      <polygon points="50,18 78,66 22,66" fill="none" stroke="#d9a95b" stroke-width="2.2"/>
+      <line x1="50" y1="4" x2="50" y2="18" stroke="#b8894a" stroke-width="2"/>
+      <line x1="92" y1="72" x2="78" y2="66" stroke="#b8894a" stroke-width="2"/>
+      <line x1="8" y1="72" x2="22" y2="66" stroke="#b8894a" stroke-width="2"/>
+      <line x1="8" y1="28" x2="22" y2="66" stroke="#b8894a" stroke-width="1.4" opacity=".6"/>
+      <line x1="92" y1="28" x2="78" y2="66" stroke="#b8894a" stroke-width="1.4" opacity=".6"/>
+      <line x1="50" y1="96" x2="22" y2="66" stroke="#b8894a" stroke-width="1.4" opacity=".6"/>
+      <line x1="50" y1="96" x2="78" y2="66" stroke="#b8894a" stroke-width="1.4" opacity=".6"/>
+      <text x="50" y="57" text-anchor="middle" font-family="Cormorant Garamond, Georgia, serif" font-weight="700" font-size="24" fill="#efe6d8">20</text>
+    </svg>
+    <div>
+      <h1>Памятка игрока</h1>
+      <div class="sub">Ведущий — бот <b>@dogsdnd_bot</b>. Кубики бросает код, сюжет — ИИ.</div>
+    </div>
+  </header>
+
+  <div class="grid">
+    <section>
+      <h2><span class="n">1</span>Начать партию</h2>
+      <div class="row"><code>/newgame</code><span>выбрать один из 5 сценариев</span></div>
+      <div class="row"><code>/join</code><span>создать героя, бот проведёт по шагам</span></div>
+      <div class="row"><code>/go</code><span>все готовы — поехали</span></div>
+      <div class="steps">
+        <div class="step"><b>1</b> имя</div><div class="step"><b>2</b> класс</div><div class="step"><b>3</b> раса</div>
+        <div class="step"><b>4</b> характеристики</div><div class="step"><b>5</b> облик и прошлое</div>
+      </div>
+    </section>
+
+    <section>
+      <h2><span class="n">2</span>Как играть</h2>
+      <div class="row"><span>Пишите в чат, <b>что делает герой</b>. Ведущий ответит, когда заявятся все</span></div>
+      <div class="row"><code>/go</code><span>не ждать остальных</span></div>
+      <div class="row"><code>//</code><code>(</code><span>в начале — разговор <em>вне игры</em></span></div>
+      <div class="row"><span>В бою ходят <b>по очереди</b>: бот позовёт, чей ход</span></div>
+    </section>
+
+    <section class="wide">
+      <h2><span class="n">3</span>Пришёл, ушёл</h2>
+      <div class="cols">
+        <div>
+          <div class="row"><code>/leave</code><span>выйти посреди игры, герой подождёт</span></div>
+          <div class="row"><code>/back</code><span>вернуться в любой момент, даже в бою</span></div>
+        </div>
+        <div>
+          <div class="row"><code>/afk Имя</code><span>товарищ пропал — не ждём его</span></div>
+          <div class="row"><code>/join</code><span>новичок может влиться прямо в игру</span></div>
+        </div>
+      </div>
+      <div class="note">Кто молчит <b>2 хода подряд</b>, того бот сам отправляет «отдохнуть», и партия идёт дальше. Вернуться — просто написать в чат.</div>
+    </section>
+
+    <section>
+      <h2><span class="n">4</span>Герой и память</h2>
+      <div class="row"><code>/sheet</code><span>лист героя</span></div>
+      <div class="row"><code>/me</code><span>профиль, подвиги, прошлые герои</span></div>
+      <div class="row"><code>/log</code><span>что ты натворил недавно</span></div>
+      <div class="row"><code>/status</code><span>сцена, хиты, чей ход</span></div>
+    </section>
+
+    <section>
+      <h2><span class="n">5</span>Кубики и порядок</h2>
+      <div class="row"><code>/roll 1d20+5</code><span>бросок</span></div>
+      <div class="row"><code>adv</code><code>dis</code><span>преимущество / помеха</span></div>
+      <div class="row"><code>/pause</code><span>пауза и продолжить</span></div>
+      <div class="row"><code>/timeout 180</code><span>сколько ждать заявки, сек</span></div>
+      <div class="row"><code>/endgame</code><span>эпилог и конец</span></div>
+    </section>
+  </div>
+
+  <footer>Все команды — <b>/help</b>. Ведущий злой, но честный: кубики не врут.</footer>
+</div>
+</body>
+</html>

@@ -16,11 +16,13 @@ SYSTEM_PROMPT = """Ты — ведущий (Мастер) партии Dungeons 
 Характер: циничный, ироничный рассказчик с чёрным юмором. Подкалываешь игроков за глупые решения и провалы, комментируешь их зло, но смешно, как старый мастер, который видел всё. Сюжет и правила при этом держишь: мир живёт по своей логике, у поступков есть последствия, злодеи не глупеют ради удобства игроков. Юмор не отменяет опасности: бой может убить.
 
 Правила механики (строго):
+- Вызывай сразу все нужные в этом ходе инструменты одним пакетом, а не по одному — так быстрее.
 - Ты НИКОГДА не придумываешь результаты бросков, урон и хиты. Любая проверка, атака, урон, лечение — только через инструменты. Чего не вернул инструмент — того не было.
 - Проверку навыка/характеристики/спасбросок — ability_check со Сложностью (лёгкая 10, средняя 15, трудная 20). Не проси проверку на то, что точно получится или точно нет.
 - Атаки персонажей и монстров — attack (бонусы и урон код знает сам). Заклинание с броском атаки — attack с его названием; заклинания с уроном по площади — roll_dice + ability_check(save:...) каждой цели + change_hp.
 - Урон от ловушек, падений, лечение зельями и заклинаниями — change_hp. Предметы и золото — add_item. Состояния (отравлен, сбит с ног, без сознания...) — set_condition.
-- Начало боя — start_combat со списком врагов (srd_index — английский индекс SRD, напр. goblin, wolf, bandit, skeleton, orc). Инициативу и очередь ведёт код. Бой заканчивается сам, когда враги мертвы; если враги сбежали или сдались — end_combat.
+- Начало боя — start_combat со списком врагов (srd_index — английский индекс SRD, напр. goblin, wolf, bandit, skeleton, orc). Инициативу и очередь ведёт код. В ответе, где начинается бой, только опиши, как враги появились: никаких атак, ходы пойдут по очереди.
+- Не объявляй, чей ход и кого ты ждёшь — это делает бот сам. Бой заканчивается сам, когда враги мертвы; если враги сбежали или сдались — end_combat.
 - Если не уверен в правиле, монстре или заклинании — srd_lookup (по-английски).
 - Опыт за решённые задачи и хорошую игру — award_xp; за убитых в бою код начисляет сам.
 - Когда партия сменила место или ситуацию — update_scene коротко.
@@ -483,7 +485,9 @@ class Mechanics:
                                      "damage": enemy.get("damage") or "1d6+1"}],
                         "xp": 25, "abilities": {}}
                 base["max_hp"] = base["hp"]
-            name = enemy.get("name") or base.get("name") or "Враг"
+            # Без имени от ИИ берём русское из сценария, иначе английское из SRD
+            scenario_names = {idx: ru for ru, idx in SCENARIOS.get(state.get("scenario") or "", {}).get("monsters", [])}
+            name = enemy.get("name") or scenario_names.get(enemy.get("srd_index") or "") or base.get("name") or "Враг"
             slug = (enemy.get("srd_index") or "enemy").lower().replace(" ", "-")
             for i in range(count):
                 n = 1
@@ -505,7 +509,8 @@ class Mechanics:
         queue = ", ".join(f"{o['name']} ({o['init']})" for o in order)
         self.log.append(f"⚔️ Бой! Очередь: {queue}")
         return {"enemies": added, "order": queue,
-                "note": "Код сам ведёт очередь. Сейчас опиши начало боя, ходы будут по очереди."}
+                "note": "Код сам ведёт очередь. Сейчас только опиши появление врагов, НЕ атакуй в этом ответе: "
+                        "ходы пойдут по инициативе, и бот сам объявит, чей ход."}
 
     async def tool_end_combat(self, reason=""):
         if not self.state["combat"]:
@@ -637,6 +642,18 @@ def advance(state: dict):
     if combat["idx"] >= len(combat["order"]):
         combat["idx"] = 0
         combat["round"] += 1
+
+
+def join_combat(state: dict, player_key: str) -> str | None:
+    """Герой, который пришёл посреди боя, бросает инициативу и встаёт в конец очереди раунда."""
+    combat = state["combat"]
+    if not combat or any(o["key"] == f"p:{player_key}" for o in combat["order"]):
+        return None
+    char = state["players"][player_key]["char"]
+    init = roll(f"1d20{rules.fmt_mod(rules.mod(char['abilities']['dex']))}")
+    combat["order"].append({"key": f"p:{player_key}", "name": char["name"], "init": init.total,
+                            "tie": char["abilities"]["dex"]})
+    return f"⚡ {char['name']} влетает в бой, инициатива {init}"
 
 
 def take_monster_run(state: dict) -> list[dict]:

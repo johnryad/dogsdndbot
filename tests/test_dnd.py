@@ -287,7 +287,7 @@ def test_full_scenario(monkeypatch):
         await h2.say(VASYA, "/sheet")
         assert "пивоварню" in h2.last()
         await h2.say(VASYA, "/me")
-        assert "Сейчас играет: Торин" in h2.last() and "атак" in h2.last()
+        assert "Сейчас играет: Торин" in h2.last() and "Подвиги: заявок" in h2.last()
         await h2.say(VASYA, "/log")
         assert "✍️ " in h2.last() and "Торин" in h2.last()
         await h2.say(VASYA, "/pause")
@@ -323,3 +323,98 @@ def test_scenarios():
             # Подробности чужих актов в промпт не попадают — экономим лимит
             other = sc["acts"][1 if act == 1 else 0]["details"]
             assert other not in block
+
+
+KOLYA = User(id=33, is_bot=False, first_name="Коля", username="kolya")
+MASHA = User(id=44, is_bot=False, first_name="Маша", username="masha")
+
+
+def test_leave_and_return(monkeypatch):
+    async def fake_srd(category, query):
+        return GOBLIN if query == "goblin" else None
+    monkeypatch.setattr(rules, "srd_find", fake_srd)
+    db_path = os.path.join(tempfile.mkdtemp(), "dnd.sqlite3")
+
+    async def make_hero(h, user, name):
+        await h.say(user, f"/join {name}")
+        await h.click(user, f"cls:{user.id}:random")
+        await h.say(user, "-")
+        await h.say(user, "-")
+
+    async def scenario():
+        h = Harness(db_path)
+        await h.start()
+        await h.say(VASYA, "/newgame Болото и тоска")
+        for user, name in ((VASYA, "Торин"), (PETYA, "Лиса"), (KOLYA, "Гнида")):
+            await make_hero(h, user, name)
+        await h.say(VASYA, "/go")
+        players = h.state["players"]
+
+        # Коля не заявился и ушёл сам — партия не ждёт, ход разыгрывается сразу
+        await h.say(VASYA, "болтаю с тиной")
+        await h.say(PETYA, "болтаю с жабой")
+        assert h.state["pending"]
+        await h.say(KOLYA, "/leave")
+        assert not players["33"]["active"] and h.state["pending"] == {}
+        assert any("Гнида" in s and "покидает" in s for s in h.session.sent)
+        assert "Гнида" in h.state["history"][-1]["actions"]  # ведущему сказали убрать героя из сцены
+        # Пока ушёл сам, сообщения в чат не возвращают
+        await h.say(KOLYA, "эй я тут")
+        assert not players["33"]["active"]
+
+        # Вернулся командой — ведущий введёт героя снова
+        await h.say(KOLYA, "/back")
+        assert players["33"]["active"] and "возвращается" in h.last()
+        assert not players["33"]["char"]["introduced"]
+
+        # Пропал без предупреждения: два хода молчит — бот перестаёт его ждать
+        for _ in range(2):
+            await h.say(VASYA, "болтаю с тиной")
+            await h.say(PETYA, "болтаю с жабой")
+            h.dnd.arm_timer(CHAT_ID, 0.05)
+            await asyncio.sleep(0.2)
+        assert not players["33"]["active"] and players["33"]["away"]
+        assert any("💤" in s for s in h.session.sent)
+        # Теперь Васи и Пети хватает, чтобы ход шёл без таймаута
+        await h.say(VASYA, "болтаю с тиной")
+        await h.say(PETYA, "болтаю с жабой")
+        assert h.state["pending"] == {}
+
+        # Отошедший возвращается, просто написав в чат, и его сообщение — уже заявка
+        await h.say(KOLYA, "болтаю с комарами")
+        assert players["33"]["active"] and h.state["pending"].get("33") == "болтаю с комарами"
+
+        # Пометить пропавшего товарища
+        await h.say(VASYA, "/afk лиса")
+        assert not players["22"]["active"]
+        await h.say(PETYA, "/back")
+        assert players["22"]["active"]
+        await h.say(VASYA, "/go")
+
+        # Бой: тот, чей ход, уходит — очередь идёт дальше
+        await h.say(VASYA, "бью гоблинов")
+        await h.say(PETYA, "бью гоблинов")
+        await h.say(KOLYA, "бью гоблинов")
+        assert h.state["combat"]
+        from dnd.gm import current_actor
+        entry = current_actor(h.state)
+        if entry and entry["key"].startswith("p:"):
+            leaver = entry["key"][2:]
+            await h.say({"11": VASYA, "22": PETYA, "33": KOLYA}[leaver], "/leave")
+            if h.state["combat"]:
+                after = current_actor(h.state)
+                assert after is None or after["key"] != f"p:{leaver}"
+
+        # Новый игрок посреди боя встаёт в очередь
+        if h.state["combat"]:
+            await make_hero(h, MASHA, "Мышь")
+            assert any(o["key"] == "p:44" for o in h.state["combat"]["order"])
+            assert "влетает в бой" in h.last()
+        h.dnd.cancel_timer(CHAT_ID)
+
+        await h.say(VASYA, "/status")
+        await h.say(VASYA, "/help")
+        assert "/afk" in h.last() and "/back" in h.last()
+        await h.dnd.storage.close()
+
+    asyncio.run(scenario())

@@ -9,18 +9,39 @@ import logging
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 
 from . import rules
 from .dice import roll, DiceError
 from .gm import (GameMaster, new_state, characters, can_act, current_actor, advance, take_monster_run,
-                 death_save, finish_combat, living_monsters, stat)
+                 death_save, finish_combat, living_monsters, stat, join_combat)
 from .llm import GeminiClient, LLMError
 from .scenarios import SCENARIOS
 from .storage import make_storage
 
 TG_LIMIT = 4000
 MAX_ACTION_LEN = 600
+# Сколько ходов подряд игрок может молчать, прежде чем бот сочтёт, что он отошёл
+AFK_LIMIT = 2
+
+# Меню команд, которое Telegram показывает при вводе «/»
+COMMANDS = [
+    ("newgame", "новая партия: выбрать сценарий"),
+    ("join", "создать героя или вернуться в игру"),
+    ("go", "начать / ведущий, отвечай без остальных"),
+    ("status", "партия, сцена, чей ход"),
+    ("sheet", "лист героя"),
+    ("me", "мой профиль и прошлые герои"),
+    ("log", "мои последние действия"),
+    ("roll", "бросок кубиков: /roll 1d20+5"),
+    ("leave", "выйти из партии (герой подождёт)"),
+    ("back", "вернуться в партию"),
+    ("afk", "отметить отошедшего: /afk Имя"),
+    ("pause", "пауза / продолжить"),
+    ("timeout", "сколько ждать заявки, сек"),
+    ("endgame", "эпилог и конец партии"),
+    ("help", "все команды"),
+]
 
 FAIL_GM = [
     "🍺 Мастер отошёл за пивом и застрял в очереди",
@@ -28,17 +49,28 @@ FAIL_GM = [
     "📜 Мастер ищет правило в книге и, кажется, уснул",
 ]
 
-HELP = """<b>ДнД-ведущий</b>
-/newgame — новая партия: один из 5 сценариев или свой мир (/newgame мир и тон)
-/join — создать героя, бот проведёт по шагам
-/go — начать приключение / ведущий отвечает, не дожидаясь всех
-/sheet — лист персонажа, /status — партия и сцена
-/me — твой профиль, статистика и прошлые герои, /log — твои последние действия
-/roll 1d20+5 [adv|dis] — бросок, /timeout 120 — сколько ждать заявки (сек)
-/pause — пауза/продолжить, /leave — выйти из партии, /endgame — эпилог
+HELP = """<b>ДнД-ведущий — команды</b>
 
-Пишите в чат, что делает персонаж. Сообщения, начинающиеся с <code>//</code> или <code>(</code>, — разговор вне игры, ведущий их не читает.
-Вне боя ведущий отвечает, когда заявились все, по /go или по таймауту. В бою ходят по инициативе: бот скажет, чей ход."""
+<b>Партия</b>
+/newgame — новая партия: 5 сценариев кнопками или свой мир (<code>/newgame мир и тон</code>)
+/go — начать приключение; потом — ведущий отвечает, не дожидаясь остальных
+/pause — пауза и продолжить, /endgame — эпилог и конец
+
+<b>Герой</b>
+/join — создать героя, бот проведёт по шагам
+/sheet — лист героя, /me — профиль и прошлые герои, /log — твои последние действия
+
+<b>Пришёл, ушёл</b>
+/leave — выйти посреди игры, партия идёт дальше, герой ждёт
+/back или /join — вернуться в любой момент, даже посреди боя
+/afk Имя — товарищ пропал? Отметь, и партия не будет его ждать
+Кто молчит 2 хода подряд, того бот сам считает отошедшим; вернётся, когда напишет в чат.
+
+<b>Как играть</b>
+Пишите в чат, что делает герой. Ведущий отвечает, когда заявились все, по /go или через 2 минуты (/timeout).
+В бою ходят по инициативе: бот позовёт того, чей ход.
+<code>//</code> или <code>(</code> в начале — разговор вне игры, ведущий не читает.
+/roll 1d20+5 adv — бросок с преимуществом (dis — с помехой), /status — что происходит"""
 
 
 def fmt(text: str) -> str:
@@ -197,8 +229,8 @@ class DndBot:
             c["introduced"] = True
         if not fresh:
             return ""
-        return "\nНовые персонажи, которых ещё не было в истории (введи их в сцену): " + ", ".join(
-            rules.brief_for_prompt(c) for c in fresh)
+        return ("\nНовые или вернувшиеся персонажи (введи их в сцену: догнали группу, вылезли из кустов, "
+                "очнулись в канаве): " + ", ".join(rules.brief_for_prompt(c) for c in fresh))
 
     async def start_adventure(self, chat_id: int):
         async with self.lock(chat_id):
@@ -236,9 +268,13 @@ class DndBot:
             for key, text in pending.items():
                 if key in chars:
                     lines.append(f"- {chars[key]['name']}: «{text}»")
-            silent = [c["name"] for k, c in chars.items() if k not in pending and can_act(c)]
+            silent_keys = [k for k, c in chars.items() if k not in pending and can_act(c)]
+            silent = [chars[k]["name"] for k in silent_keys]
             if silent:
                 lines.append(f"Промолчали (просто следуют за группой): {', '.join(silent)}")
+            gone = self.departed_note(state)
+            if gone:
+                lines.append(gone)
             turn = "\n".join(lines) + self.newcomers_note(state)
             state["pending"] = {}
             state["round"] += 1
@@ -249,6 +285,8 @@ class DndBot:
                 return
             text, log, combat_started = result
             await self.send_gm(chat_id, text, log)
+            for key in silent_keys:
+                await self.count_missed(chat_id, state, key)
             if combat_started and state["combat"]:
                 await self.run_combat(chat_id, state)
             await self.save(chat_id)
@@ -267,13 +305,17 @@ class DndBot:
             self.cancel_timer(chat_id)
             char = state["players"][player_key]["char"]
             state["pending"].pop(player_key, None)
-            if action is None:
+            missed = action is None
+            if missed:
                 action = "(игрок задумался и не успел — персонаж занимает оборону: действие Уклонение)"
             snapshot = json.loads(json.dumps(state))
             advance(state)
             monsters = take_monster_run(state)
             turn = f"Раунд {state['combat']['round']}. Ход персонажа {char['name']}: «{action}»."
             turn += self.monsters_note(state, monsters)
+            gone = self.departed_note(state)
+            if gone:
+                turn += "\n" + gone
             result = await self.safe_narrate(chat_id, state, turn)
             if result is None:
                 state.clear()
@@ -282,8 +324,80 @@ class DndBot:
                 await self.save(chat_id)
                 return
             await self.send_gm(chat_id, result[0], result[1])
+            if missed:
+                await self.count_missed(chat_id, state, player_key)
+            else:
+                state["players"][player_key]["missed"] = 0
             await self.run_combat(chat_id, state)
             await self.save(chat_id)
+
+    # --- пришёл, ушёл ---
+
+    async def count_missed(self, chat_id: int, state: dict, key: str):
+        """Игрок пропустил ход. После AFK_LIMIT пропусков подряд партия перестаёт его ждать."""
+        player = state["players"][key]
+        player["missed"] = player.get("missed", 0) + 1
+        if player["missed"] >= AFK_LIMIT and player.get("active", True):
+            self.set_inactive(state, key, away=True)
+            await self.chronicle(chat_id, "leave", f"{player['name']} молчит — отмечен отошедшим", int(key),
+                                 player["char"]["name"])
+            await self.send(chat_id, f"💤 {mention(key, player['name'])} молчит {player['missed']} хода — "
+                                     f"<b>{html.escape(player['char']['name'])}</b> отстаёт от группы, партия идёт "
+                                     "дальше. Вернуться — просто написать в чат или /back.")
+
+    def set_inactive(self, state: dict, key: str, away: bool):
+        player = state["players"][key]
+        player["active"] = False
+        player["away"] = away
+        state["pending"].pop(key, None)
+        if player.get("char"):
+            state.setdefault("departed", []).append(player["char"]["name"])
+
+    def departed_note(self, state: dict) -> str:
+        """Кто ушёл из партии с прошлого хода — чтобы ведущий убрал их из сцены."""
+        gone = state.pop("departed", [])
+        if not gone:
+            return ""
+        return (f"Из партии ушли (игроки отошли): {', '.join(gone)}. Убери этих героев из сцены одной фразой "
+                "(отстали, отвлеклись, ушли по делам) и больше за них не играй.")
+
+    async def leave(self, chat_id: int, key: str, away: bool, by: str):
+        """Уход посреди игры: партия не ждёт ушедшего, его ход в бою пропускается."""
+        async with self.lock(chat_id):
+            state = await self.get(chat_id)
+            player = state["players"][key]
+            char = player.get("char")
+            was_current = bool(state["combat"]) and (current_actor(state) or {}).get("key") == f"p:{key}"
+            self.set_inactive(state, key, away)
+            await self.chronicle(chat_id, "leave", f"{player['name']} вышел ({by})", int(key), (char or {}).get("name", ""))
+            hero = f"<b>{html.escape(char['name'])}</b>" if char else "Игрок"
+            back = "вернётся, когда напишет в чат или /back" if away else "вернуться — /back или /join"
+            await self.send(chat_id, f"🚪 {hero} покидает партию ({html.escape(by)}). Играем дальше без него, {back}.")
+            if was_current and state["status"] == "active":
+                self.cancel_timer(chat_id)
+                await self.run_combat(chat_id, state)
+            await self.save(chat_id)
+        if not state["combat"] and state["status"] == "active" and state["pending"]:
+            waiting = [k for k, c in characters(state).items() if can_act(c) and k not in state["pending"]]
+            if not waiting:
+                await self.resolve_round(chat_id)
+
+    async def come_back(self, chat_id: int, state: dict, key: str) -> str:
+        """Возвращает героя в партию; посреди боя — с броском инициативы."""
+        player = state["players"][key]
+        char = player["char"]
+        player.update(active=True, away=False, missed=0)
+        # Ведущий снова введёт героя в сцену
+        char["introduced"] = False
+        note = join_combat(state, key) if state["combat"] else None
+        await self.chronicle(chat_id, "join", f"{player['name']} вернулся", int(key), char["name"])
+        await self.save(chat_id)
+        text = f"👋 <b>{html.escape(char['name'])}</b> возвращается в партию."
+        if note:
+            text += "\n" + fmt(note)
+        elif state["status"] == "active" and not state["combat"]:
+            text += " Пиши, что делает герой."
+        return text
 
     def monsters_note(self, state: dict, monsters: list[dict]) -> str:
         alive = [m for m in monsters if not state["monsters"].get(m["key"][2:], {}).get("dead")]
@@ -320,8 +434,10 @@ class DndBot:
                 return
             if entry["key"].startswith("m:"):
                 monsters = take_monster_run(state)
+                gone = self.departed_note(state)
                 result = await self.safe_narrate(
-                    chat_id, state, f"Раунд {combat['round']}." + self.monsters_note(state, monsters))
+                    chat_id, state, f"Раунд {combat['round']}." + self.monsters_note(state, monsters)
+                    + (f"\n{gone}" if gone else ""))
                 if result is None:
                     return
                 await self.send_gm(chat_id, result[0], result[1])
@@ -360,6 +476,8 @@ class DndBot:
         r.message.register(self.cmd_roll, Command("roll", "r"))
         r.message.register(self.cmd_timeout, Command("timeout"))
         r.message.register(self.cmd_leave, Command("leave"))
+        r.message.register(self.cmd_back, Command("back"))
+        r.message.register(self.cmd_afk, Command("afk"))
         r.message.register(self.cmd_me, Command("me", "profile"))
         r.message.register(self.cmd_log, Command("log"))
         r.message.register(self.on_text, F.text)
@@ -423,10 +541,13 @@ class DndBot:
         key = str(message.from_user.id)
         player = state["players"].get(key)
         if player and player.get("char") and not player["char"]["death"]["dead"]:
-            player["active"] = True
-            await self.save(message.chat.id)
-            await message.answer(f"Ты уже в игре как {html.escape(player['char']['name'])}. /sheet — лист.",
-                                 parse_mode="HTML")
+            if player.get("active", True):
+                await message.answer(f"Ты уже в игре как {html.escape(player['char']['name'])}. /sheet — лист.",
+                                     parse_mode="HTML")
+                return
+            async with self.lock(message.chat.id):
+                text = await self.come_back(message.chat.id, state, key)
+            await self.send(message.chat.id, text)
             return
         if player and player.get("char"):
             await self.archive_hero(message.chat.id, state, key, "погиб")
@@ -587,11 +708,12 @@ class DndBot:
         char["introduced"] = state["status"] == "lobby"
         player["char"] = char
         player["draft"] = None
+        note = join_combat(state, key) if state["combat"] else None
         await self.save(chat_id)
         await self.touch_profile(int(key), player)
         await self.chronicle(chat_id, "join", f"{player['name']} создал героя: {rules.brief_for_prompt(char)}",
                              int(key), char["name"])
-        await self.send(chat_id, "✅ Герой готов:\n" + rules.sheet_text(char))
+        await self.send(chat_id, "✅ Герой готов:\n" + rules.sheet_text(char) + (f"\n\n{fmt(note)}" if note else ""))
 
     async def cmd_sheet(self, message: Message, command: CommandObject):
         state = await self.get(message.chat.id)
@@ -620,7 +742,10 @@ class DndBot:
             lines.append(f"📍 {html.escape(state['scene'])}")
         for key, player in state["players"].items():
             char = player.get("char")
-            if not char or not player.get("active", True):
+            if not char:
+                continue
+            if not player.get("active", True):
+                lines.append(f"💤 {html.escape(char['name'])} ({html.escape(player['name'])}): не в партии, /back")
                 continue
             mark = "✍️" if key in state["pending"] else "…"
             if char["death"]["dead"]:
@@ -810,13 +935,46 @@ class DndBot:
 
     async def cmd_leave(self, message: Message):
         state = await self.get(message.chat.id)
-        player = (state or {}).get("players", {}).get(str(message.from_user.id))
-        if not player:
+        key = str(message.from_user.id)
+        player = (state or {}).get("players", {}).get(key)
+        if not player or not player.get("active", True) or state["status"] == "ended":
+            await message.answer("Тебя и так нет в партии.")
             return
-        player["active"] = False
-        state["pending"].pop(str(message.from_user.id), None)
-        await self.save(message.chat.id)
-        await message.answer("Персонаж ушёл в закат. /join — вернуться.")
+        if player.get("draft") and not player.get("char"):
+            state["players"].pop(key)
+            await self.save(message.chat.id)
+            await message.answer("Создание героя отменено.")
+            return
+        await self.leave(message.chat.id, key, away=False, by="ушёл сам")
+
+    async def cmd_back(self, message: Message):
+        state = await self.get(message.chat.id)
+        key = str(message.from_user.id)
+        player = (state or {}).get("players", {}).get(key)
+        if not player or not player.get("char") or player["char"]["death"]["dead"]:
+            await message.answer("Возвращаться некому. /join — создать героя.")
+            return
+        if player.get("active", True):
+            await message.answer("Ты и так в партии.")
+            return
+        async with self.lock(message.chat.id):
+            text = await self.come_back(message.chat.id, state, key)
+        await self.send(message.chat.id, text)
+
+    async def cmd_afk(self, message: Message, command: CommandObject):
+        state = await self.get(message.chat.id)
+        if not state or state["status"] not in ("lobby", "active", "paused"):
+            return
+        if not command.args:
+            await message.answer("Кого отметить? <code>/afk Имя героя</code>. Себя — /leave.", parse_mode="HTML")
+            return
+        target = command.args.strip().lower()
+        found = [k for k, p in state["players"].items()
+                 if p.get("char") and p.get("active", True) and target in p["char"]["name"].lower()]
+        if not found:
+            await message.answer("Такого героя в партии нет. /status — кто есть.")
+            return
+        await self.leave(message.chat.id, found[0], away=True, by=f"отметил {message.from_user.first_name}")
 
     async def on_text(self, message: Message):
         chat_id = message.chat.id
@@ -828,8 +986,15 @@ class DndBot:
             return
         key = str(message.from_user.id)
         player = state["players"].get(key)
-        if not player or not player.get("active", True):
+        if not player:
             return
+        if not player.get("active", True):
+            # Отошедший (не ушедший сам) возвращается, просто написав в чат
+            if not player.get("away") or not player.get("char") or player["char"]["death"]["dead"]:
+                return
+            async with self.lock(chat_id):
+                notice = await self.come_back(chat_id, state, key)
+            await self.send(chat_id, notice)
         draft = player.get("draft")
         if draft and draft.get("step") == "name":
             name = clean_name(text)
@@ -854,6 +1019,7 @@ class DndBot:
 
         await self.chronicle(chat_id, "action", text, message.from_user.id, char["name"])
         stat(char, "actions")
+        player["missed"] = 0
 
         if state["combat"]:
             entry = current_actor(state)
@@ -881,6 +1047,10 @@ class DndBot:
         try:
             await self.restore()
             me = await self.bot.get_me()
+            try:
+                await self.bot.set_my_commands([BotCommand(command=c, description=d) for c, d in COMMANDS])
+            except Exception as e:
+                logging.warning(f"ДнД: не смог задать меню команд: {e}")
             logging.info(f"ДнД-бот @{me.username} запущен")
             await self.dp.start_polling(self.bot, handle_signals=handle_signals,
                                         allowed_updates=self.dp.resolve_used_update_types())
@@ -893,10 +1063,10 @@ def from_env(token: str) -> DndBot:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GEMINI_API_KEY не установлен!")
-    models = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.8-flash,gemini-3.5-flash-lite").split(",")
+    models = [m.strip() for m in os.getenv("GEMINI_MODELS", "gemini-3.5-flash,gemini-3.8-flash,gemini-3.5-flash-lite").split(",")
               if m.strip()]
     llm = GeminiClient(api_key, models, rpm=int(os.getenv("GEMINI_RPM", 8)),
-                       thinking_level=os.getenv("GEMINI_THINKING") or None)
+                       thinking_level=os.getenv("GEMINI_THINKING", "low") or None)
     storage = make_storage(os.getenv("DATABASE_URL"), os.getenv("DND_SQLITE", "dnd.sqlite3"))
     allowed = {int(x) for x in os.getenv("DND_ALLOWED_CHATS", "").replace(" ", "").split(",") if x}
     return DndBot(token, llm, storage, allowed or None)
