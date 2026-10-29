@@ -3,12 +3,15 @@ import os
 import re
 import html
 import json
+import hashlib
 import random
 import asyncio
 import logging
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
 
 from . import rules
@@ -1042,21 +1045,57 @@ class DndBot:
 
     # --- запуск ---
 
-    async def run(self, handle_signals: bool = True):
+    async def startup(self):
         await self.storage.connect()
+        await self.restore()
+        me = await self.bot.get_me()
         try:
-            await self.restore()
-            me = await self.bot.get_me()
-            try:
-                await self.bot.set_my_commands([BotCommand(command=c, description=d) for c, d in COMMANDS])
-            except Exception as e:
-                logging.warning(f"ДнД: не смог задать меню команд: {e}")
-            logging.info(f"ДнД-бот @{me.username} запущен")
+            await self.bot.set_my_commands([BotCommand(command=c, description=d) for c, d in COMMANDS])
+        except Exception as e:
+            logging.warning(f"ДнД: не смог задать меню команд: {e}")
+        logging.info(f"ДнД-бот @{me.username} запущен")
+
+    async def shutdown(self):
+        await self.storage.close()
+        await self.bot.session.close()
+
+    async def run(self, handle_signals: bool = True):
+        """Опрос Telegram — для локального запуска."""
+        try:
+            await self.startup()
+            # Если на Render стоит вебхук, getUpdates не работает — снимаем его (Render поставит заново при старте)
+            await self.bot.delete_webhook()
             await self.dp.start_polling(self.bot, handle_signals=handle_signals,
                                         allowed_updates=self.dp.resolve_used_update_types())
         finally:
-            await self.storage.close()
-            await self.bot.session.close()
+            await self.shutdown()
+
+    def webhook_secret(self) -> str:
+        """Секрет вебхука выводится из токена: одинаковый между рестартами и без лишней переменной."""
+        return hashlib.sha256(self.bot.token.encode()).hexdigest()[:48]
+
+    def mount_webhook(self, app: web.Application, base_url: str):
+        """Вебхук: Telegram сам присылает сообщения и будит уснувший сервис на Render free.
+
+        Сервис работает только пока идёт игра, cron-пинг не нужен.
+        """
+        secret = self.webhook_secret()
+        path = f"/telegram/{secret[:16]}"
+        SimpleRequestHandler(self.dp, self.bot, secret_token=secret).register(app, path=path)
+
+        async def on_startup(_):
+            await self.startup()
+            await self.bot.set_webhook(base_url.rstrip("/") + path, secret_token=secret,
+                                       allowed_updates=self.dp.resolve_used_update_types())
+            logging.info("ДнД: вебхук установлен")
+
+        async def on_cleanup(_):
+            for task in list(self.timers.values()):
+                task.cancel()
+            await self.shutdown()
+
+        app.on_startup.append(on_startup)
+        app.on_cleanup.append(on_cleanup)
 
 
 def from_env(token: str) -> DndBot:
@@ -1074,3 +1113,10 @@ def from_env(token: str) -> DndBot:
 
 async def run_dnd(token: str, handle_signals: bool = True):
     await from_env(token).run(handle_signals=handle_signals)
+
+
+def webhook_base_url() -> str | None:
+    """Адрес сервиса для вебхука. Render сам задаёт RENDER_EXTERNAL_URL; DND_POLLING=1 — принудительно опрос."""
+    if os.getenv("DND_POLLING") == "1":
+        return None
+    return os.getenv("WEBHOOK_URL") or os.getenv("RENDER_EXTERNAL_URL")

@@ -33,9 +33,12 @@ class FakeSession(BaseSession):
         super().__init__()
         self.sent: list[str] = []
         self.next_id = 1000
+        self.webhook = None
 
     async def make_request(self, bot, method, timeout=None):
         name = type(method).__name__
+        if name == "SetWebhook":
+            self.webhook = method.url
         if name == "GetMe":
             return User(id=1, is_bot=True, first_name="ГМ", username="gm_bot")
         if name in ("SendMessage", "EditMessageText"):
@@ -416,5 +419,36 @@ def test_leave_and_return(monkeypatch):
         await h.say(VASYA, "/help")
         assert "/afk" in h.last() and "/back" in h.last()
         await h.dnd.storage.close()
+
+    asyncio.run(scenario())
+
+
+def test_webhook():
+    from aiohttp import web
+    from aiohttp.test_utils import TestServer, TestClient
+
+    async def scenario():
+        h = Harness(os.path.join(tempfile.mkdtemp(), "dnd.sqlite3"))
+        app = web.Application()
+        h.dnd.mount_webhook(app, "https://dogs.onrender.com/")
+        async with TestClient(TestServer(app)) as client:
+            assert h.session.webhook.startswith("https://dogs.onrender.com/telegram/")
+            path = "/" + h.session.webhook.split("/", 3)[3]
+            update = {
+                "update_id": 1,
+                "message": {"message_id": 1, "date": int(datetime.datetime.now().timestamp()),
+                            "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Подземелье"},
+                            "from": VASYA.model_dump(), "text": "/newgame",
+                            "entities": [{"type": "bot_command", "offset": 0, "length": 8}]},
+            }
+            # Чужой запрос без секрета Telegram не проходит
+            resp = await client.post(path, json=update)
+            assert resp.status == 401
+            resp = await client.post(path, json=update,
+                                     headers={"X-Telegram-Bot-Api-Secret-Token": h.dnd.webhook_secret()})
+            assert resp.status == 200
+            await asyncio.sleep(0.2)
+            assert "Похмелье в Гнилом Броде" in h.last()
+            assert (await client.get("/")).status == 404  # health-эндпоинт добавляет main.py
 
     asyncio.run(scenario())

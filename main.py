@@ -1,11 +1,12 @@
-"""Точка входа: health-эндпоинт для Render и cron-пинга + ДнД-бот."""
+"""Точка входа: на Render — веб-сервер с вебхуком Telegram, локально — опрос."""
 import os
+import signal
 import asyncio
 import logging
 
 from aiohttp import web
 
-from dnd.bot import run_dnd
+from dnd.bot import from_env, webhook_base_url
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -26,14 +27,10 @@ async def health_check(request):
     return web.Response(text="DnD bot is running OK!")
 
 
-async def start_web_server():
+def make_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", 8080))
-    await web.TCPSite(runner, "0.0.0.0", port).start()
-    logging.info(f"Health-эндпоинт на порту {port}")
+    return app
 
 
 async def main():
@@ -41,8 +38,35 @@ async def main():
     token = os.getenv("BOT_TOKEN") or os.getenv("DND_BOT_TOKEN")
     if not token:
         raise ValueError("BOT_TOKEN не установлен!")
-    await start_web_server()
-    await run_dnd(token, handle_signals=True)
+    dnd = from_env(token)
+    port = int(os.getenv("PORT", 8080))
+    base_url = webhook_base_url()
+    app = make_app()
+
+    if base_url:
+        # Render free усыпляет сервис без запросов; вебхук будит его входящим сообщением
+        dnd.mount_webhook(app, base_url)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "0.0.0.0", port).start()
+        logging.info(f"Режим вебхука: {base_url}, порт {port}")
+        stop = asyncio.Event()
+        try:
+            # Render останавливает сервис через SIGTERM — закрываем базу и сессию аккуратно
+            asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stop.set)
+        except (NotImplementedError, AttributeError):
+            pass
+        try:
+            await stop.wait()
+        finally:
+            await runner.cleanup()
+        return
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logging.info(f"Режим опроса, health-эндпоинт на порту {port}")
+    await dnd.run(handle_signals=True)
 
 
 if __name__ == "__main__":
