@@ -47,7 +47,8 @@ COMMANDS = [
     ("here", "перенести игру в этот топик"),
     ("timeout", "таймауты: /timeout 300 или off"),
     ("endgame", "эпилог и конец партии"),
-    ("wipe", "сбросить прогресс чата (2 подтверждения)"),
+    ("wipe", "сбросить партию и героев участников (2 подтверждения)"),
+    ("ask", "вопрос боту вне игры: /ask текст"),
     ("help", "все команды"),
 ]
 
@@ -63,7 +64,8 @@ HELP = """<b>ДнД-ведущий — команды</b>
 /newgame — новая партия: 11 приключений кнопками или свой мир (<code>/newgame мир и тон</code>)
 /go — начать приключение; потом — ведущий отвечает, не дожидаясь остальных
 /settings — настройки до игры; /pause — пауза и продолжить, /endgame — эпилог и конец
-/wipe — удалить прогресс этого чата (требует двух подтверждений администратора)
+/wipe — удалить партию, журнал и все прошлые записи героев участников во всех кампаниях (2 подтверждения администратора)
+/ask вопрос — спросить бота вне игры, ответ будет в отдельном блоке
 /here — перенести игру в этот топик (партия живёт в топике, где сделали /newgame)
 
 <b>Герой</b>
@@ -117,7 +119,7 @@ def topic_of(message: Message | None) -> int | None:
 
 
 # Команды, которые работают из любого топика, даже когда партия привязана к другому
-ANY_TOPIC_COMMANDS = {"/newgame", "/here", "/help", "/start"}
+ANY_TOPIC_COMMANDS = {"/newgame", "/here", "/help", "/start", "/ask"}
 
 
 def clean_name(name: str) -> str:
@@ -135,7 +137,7 @@ class DndBot:
         self.states: dict[int, dict] = {}
         self.locks: dict[int, asyncio.Lock] = {}
         self.timers: dict[int, asyncio.Task] = {}
-        self.wipe_confirmations: dict[str, tuple[int, int, dict[int, tuple[tuple[str, str], ...]], float]] = {}
+        self.wipe_confirmations: dict[str, tuple[int, int, set[int], float]] = {}
         self.router = Router()
         self._register()
         self.dp.include_router(self.router)
@@ -480,6 +482,13 @@ class DndBot:
                     "(плен, ограбление, издевательства, смерть для мёртвых) и опиши, где они очнутся.")
                 if result:
                     await self.send_gm(chat_id, result[0], log + result[1])
+                await self.send(
+                    chat_id,
+                    "⏸ <b>Бой завершён: вся группа выбыла из строя.</b> Игра не зависла. "
+                    "Если герои без сознания — союзники могут их стабилизировать, а ведущий продолжит сцену. "
+                    "Если герой погиб окончательно, игрок может создать нового через /join; обсудить правила вне игры — /ask. "
+                    "Завершить кампанию можно через /endgame.",
+                )
                 return
             entry = current_actor(state)
             if entry is None:
@@ -541,6 +550,7 @@ class DndBot:
         r.message.register(self.cmd_pause, Command("pause", "resume"))
         r.message.register(self.cmd_endgame, Command("endgame"))
         r.message.register(self.cmd_wipe, Command("wipe"))
+        r.message.register(self.cmd_ask, Command("ask"))
         r.message.register(self.cmd_roll, Command("roll", "r"))
         r.message.register(self.cmd_timeout, Command("timeout"))
         r.message.register(self.cmd_leave, Command("leave"))
@@ -559,6 +569,32 @@ class DndBot:
 
     async def cmd_help(self, message: Message):
         await message.answer(HELP, parse_mode="HTML")
+
+    async def cmd_ask(self, message: Message, command: CommandObject):
+        question = (command.args or "").strip()
+        if not question:
+            await message.answer("Напиши вопрос после команды, например: <code>/ask как работают спасброски от смерти?</code>", parse_mode="HTML")
+            return
+        if not self.allowed(message.chat.id):
+            return
+        question = question[:1500]
+        try:
+            await self.bot.send_chat_action(message.chat.id, "typing", message_thread_id=topic_of(message))
+        except Exception:
+            pass
+        try:
+            content = await self.gm.llm.generate(
+                "Ты помощник по D&D и другим вопросам вне ролевой игры. Отвечай по-русски, понятно и по делу; "
+                "используй Markdown для заголовков, списков и выделения. Не описывай действия персонажей и не меняй "
+                "состояние партии. Если не уверен — прямо скажи об этом.",
+                [{"role": "user", "parts": [{"text": question}]}], None, temperature=0.6,
+            )
+            answer = "\n".join(p.get("text", "") for p in content["parts"] if p.get("text") and not p.get("thought")).strip()
+            if not answer:
+                raise LLMError("пустой ответ")
+            await message.answer(f"<blockquote>💬 <b>Вне игры · ответ бота</b>\n\n{fmt(answer[:3400])}</blockquote>", parse_mode="HTML")
+        except LLMError:
+            await message.answer("🤖 Сейчас не получилось ответить. Попробуй /ask ещё раз через минуту.")
 
     async def cmd_newgame(self, message: Message, command: CommandObject):
         if not self.allowed(message.chat.id):
@@ -934,24 +970,16 @@ class DndBot:
             await message.answer("В этом чате нет сохранённой партии.")
             return
         token = secrets.token_hex(4)
-        scenario = SCENARIOS.get(state.get("scenario") or {})
-        scenario_title = scenario["title"] if scenario else "свой мир"
-        archived_heroes = {
-            int(uid): tuple(
-                (player["char"]["name"], scenario_title)
-                for player in [state.get("players", {}).get(uid, {})]
-                if player.get("char", {}).get("archived")
-            )
-            for uid in state.get("players", {})
-        }
-        self.wipe_confirmations[token] = (chat_id, message.from_user.id, archived_heroes, time.monotonic() + 60)
+        party_users = {int(uid) for uid in state.get("players", {})}
+        self.wipe_confirmations[token] = (chat_id, message.from_user.id, party_users, time.monotonic() + 60)
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="Продолжить", callback_data=f"wipe:1:{token}"),
             InlineKeyboardButton(text="Отмена", callback_data=f"wipe:cancel:{token}"),
         ]])
         await message.answer(
-            "⚠️ Сброс удалит партию и журнал этого чата, а также архивные записи героев из этой партии. "
-            "На первом шаге нажмите «Продолжить», чтобы перейти ко второму подтверждению.",
+            f"⚠️ Будут удалены текущая партия и журнал этого чата, а также ВСЕ записи прошлых героев "
+            f"{len(party_users)} участника(ов) этой партии во всех их кампаниях. Истории других чатов и прочие поля профилей сохранятся. "
+            "Нажмите «Продолжить», чтобы перейти ко второму подтверждению.",
             reply_markup=kb,
         )
 
@@ -962,7 +990,7 @@ class DndBot:
         if not pending:
             await query.answer("Подтверждение истекло.", show_alert=True)
             return
-        chat_id, owner_id, archived_heroes, expires = pending
+        chat_id, owner_id, party_users, expires = pending
         if query.from_user.id != owner_id or query.message.chat.id != chat_id:
             await query.answer("Это подтверждение создано другим администратором.", show_alert=True)
             return
@@ -991,8 +1019,9 @@ class DndBot:
             ]])
             await query.answer()
             await query.message.edit_text(
-                "Последнее подтверждение: будут удалены текущая партия, журнал и архивные записи героев именно этой партии. "
-                "Восстановить их нельзя.",
+                f"Последнее подтверждение: удалить партию и журнал этого чата, а также все записи прошлых героев "
+                f"{len(party_users)} участников во всех их кампаниях. Журналы других чатов и прочие поля профилей останутся нетронуты. "
+                "Восстановить удалённые записи нельзя.",
                 reply_markup=kb,
             )
             return
@@ -1004,7 +1033,7 @@ class DndBot:
         await query.message.edit_reply_markup(reply_markup=None)
         async with self.lock(chat_id):
             self.cancel_timer(chat_id)
-            await self.storage.wipe_chat(chat_id, archived_heroes)
+            await self.storage.wipe_chat(chat_id, party_users)
             self.states.pop(chat_id, None)
         await query.message.edit_text("🧹 Прогресс этого чата удалён. Можно начать заново командой /newgame.")
 
@@ -1256,7 +1285,19 @@ class DndBot:
             await self.finish_char(chat_id, key)
             return
         char = player.get("char")
-        if state["status"] != "active" or not char or not can_act(char):
+        if state["status"] != "active" or not char:
+            return
+        if char["death"]["dead"]:
+            await message.reply(
+                f"💀 <b>{html.escape(char['name'])} погиб.</b> Его действия больше не принимаются. "
+                "Союзники могут попытаться вернуть его к жизни; иначе создай нового героя командой /join. "
+                "Вопрос вне игры — /ask, закончить партию — /endgame.", parse_mode="HTML")
+            return
+        if char["hp"] <= 0 or not can_act(char):
+            await message.reply(
+                f"🩹 <b>{html.escape(char['name'])} без сознания</b> и сейчас не может действовать. "
+                "В бою бот автоматически бросает спасброски от смерти. Союзник может помочь или стабилизировать героя; "
+                "можно написать /status, спросить вне игры через /ask или дождаться следующего хода.", parse_mode="HTML")
             return
         text = text[:MAX_ACTION_LEN]
 

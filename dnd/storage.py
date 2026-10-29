@@ -22,7 +22,7 @@ class Storage:
     async def recent_log(self, chat_id: int, user_id: int, char: str, limit: int) -> list[tuple[str, str]]: ...
     async def load_profile(self, user_id: int) -> dict | None: ...
     async def save_profile(self, user_id: int, profile: dict): ...
-    async def wipe_chat(self, chat_id: int, archived_heroes: dict[int, tuple[tuple[str, str], ...]]): ...
+    async def wipe_chat(self, chat_id: int, player_ids: set[int]): ...
     async def close(self): ...
 
 
@@ -112,17 +112,13 @@ class SqliteStorage(Storage):
             (user_id, json.dumps(profile, ensure_ascii=False)), commit=True,
         )
 
-    async def wipe_chat(self, chat_id, archived_heroes):
+    async def wipe_chat(self, chat_id, player_ids):
         await self._run("DELETE FROM dnd_games WHERE chat_id = ?", (chat_id,), commit=True)
         await self._run("DELETE FROM dnd_log WHERE chat_id = ?", (chat_id,), commit=True)
-        for user_id, heroes in archived_heroes.items():
+        for user_id in player_ids:
             profile = await self.load_profile(user_id)
             if profile is not None:
-                targets = set(heroes)
-                profile["heroes"] = [
-                    hero for hero in profile.get("heroes", [])
-                    if (hero.get("name"), hero.get("scenario")) not in targets
-                ]
+                profile["heroes"] = []
                 await self.save_profile(user_id, profile)
 
     async def close(self):
@@ -178,20 +174,16 @@ class PostgresStorage(Storage):
             user_id, json.dumps(profile, ensure_ascii=False),
         )
 
-    async def wipe_chat(self, chat_id, archived_heroes):
+    async def wipe_chat(self, chat_id, player_ids):
         async with self.pool.acquire() as conn:
             async with conn.transaction():
                 await conn.execute("DELETE FROM dnd_games WHERE chat_id = $1", chat_id)
                 await conn.execute("DELETE FROM dnd_log WHERE chat_id = $1", chat_id)
-                for user_id, heroes in archived_heroes.items():
+                for user_id in player_ids:
                     row = await conn.fetchrow("SELECT profile FROM dnd_players WHERE user_id = $1 FOR UPDATE", user_id)
                     if row:
                         profile = row["profile"]
-                        targets = set(heroes)
-                        profile["heroes"] = [
-                            hero for hero in profile.get("heroes", [])
-                            if (hero.get("name"), hero.get("scenario")) not in targets
-                        ]
+                        profile["heroes"] = []
                         await conn.execute(
                             "UPDATE dnd_players SET profile = $2::jsonb, updated_at = now() WHERE user_id = $1",
                             user_id, json.dumps(profile, ensure_ascii=False),
