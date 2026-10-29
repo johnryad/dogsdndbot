@@ -32,7 +32,8 @@ COMMANDS = [
     ("newgame", "новая партия: выбрать сценарий"),
     ("join", "создать героя или вернуться в игру"),
     ("go", "начать / ведущий, отвечай без остальных"),
-    ("status", "партия, сцена, чей ход"),
+    ("status", "что происходит и кого ждём"),
+    ("settings", "настройки партии перед стартом"),
     ("sheet", "лист героя"),
     ("me", "мой профиль и прошлые герои"),
     ("log", "мои последние действия"),
@@ -42,7 +43,7 @@ COMMANDS = [
     ("afk", "отметить отошедшего: /afk Имя"),
     ("pause", "пауза / продолжить"),
     ("here", "перенести игру в этот топик"),
-    ("timeout", "сколько ждать заявки, сек"),
+    ("timeout", "таймауты: /timeout 300 или off"),
     ("endgame", "эпилог и конец партии"),
     ("help", "все команды"),
 ]
@@ -56,9 +57,9 @@ FAIL_GM = [
 HELP = """<b>ДнД-ведущий — команды</b>
 
 <b>Партия</b>
-/newgame — новая партия: 5 сценариев кнопками или свой мир (<code>/newgame мир и тон</code>)
+/newgame — новая партия: 6 сценариев кнопками или свой мир (<code>/newgame мир и тон</code>)
 /go — начать приключение; потом — ведущий отвечает, не дожидаясь остальных
-/pause — пауза и продолжить, /endgame — эпилог и конец
+/settings — настройки до игры; /pause — пауза и продолжить, /endgame — эпилог и конец
 /here — перенести игру в этот топик (партия живёт в топике, где сделали /newgame)
 
 <b>Герой</b>
@@ -72,7 +73,7 @@ HELP = """<b>ДнД-ведущий — команды</b>
 Кто молчит 2 хода подряд, того бот сам считает отошедшим; вернётся, когда напишет в чат.
 
 <b>Как играть</b>
-Пишите в чат, что делает герой. Ведущий отвечает, когда заявились все, по /go или через 2 минуты (/timeout).
+Пишите в чат, что делает герой. Ведущий отвечает, когда заявились все, по /go или по таймауту. Настройки: /settings в лобби, /timeout 300 или /timeout off в игре.
 В бою ходят по инициативе: бот позовёт того, чей ход.
 <code>//</code> или <code>(</code> в начале — разговор вне игры, ведущий не читает.
 /roll 1d20+5 adv — бросок с преимуществом (dis — с помехой), /status — что происходит"""
@@ -195,9 +196,10 @@ class DndBot:
         if task and task is not asyncio.current_task():
             task.cancel()
 
-    def arm_timer(self, chat_id: int, seconds: int):
+    def arm_timer(self, chat_id: int, seconds: int | None):
         self.cancel_timer(chat_id)
-        self.timers[chat_id] = asyncio.create_task(self._timer(chat_id, seconds))
+        if seconds:
+            self.timers[chat_id] = asyncio.create_task(self._timer(chat_id, seconds))
 
     async def _timer(self, chat_id: int, seconds: int):
         try:
@@ -225,7 +227,8 @@ class DndBot:
             if not state or state["status"] != "active":
                 continue
             if state["combat"] or state["pending"]:
-                self.arm_timer(chat_id, state["timeout"])
+                seconds = state.get("combat_timeout", state.get("timeout", 120)) if state["combat"] else state.get("timeout", 120)
+                self.arm_timer(chat_id, seconds)
                 logging.info(f"ДнД: восстановил партию в чате {chat_id}")
 
     # --- розыгрыш ---
@@ -237,6 +240,7 @@ class DndBot:
             await self.bot.send_chat_action(chat_id, "typing", message_thread_id=self.thread(chat_id))
         except Exception:
             pass
+        state["turn_label"] = "Ведущий обрабатывает текущий ход"
         try:
             return await self.gm.narrate(state, turn_text, use_tools)
         except LLMError as e:
@@ -245,6 +249,8 @@ class DndBot:
             state.update(snapshot)
             await self.send(chat_id, f"{random.choice(FAIL_GM)}. Заявки сохранены — попробуйте /go через минуту.")
             return None
+        finally:
+            state["turn_label"] = ""
 
     def newcomers_note(self, state: dict) -> str:
         fresh = [c for c in characters(state).values() if not c.get("introduced")]
@@ -347,6 +353,9 @@ class DndBot:
                 await self.save(chat_id)
                 return
             await self.send_gm(chat_id, result[0], result[1])
+            hp_summary = self.combat_hp_summary(state)
+            if hp_summary:
+                await self.send(chat_id, hp_summary)
             if missed:
                 await self.count_missed(chat_id, state, player_key)
             else:
@@ -422,6 +431,21 @@ class DndBot:
             text += " Пиши, что делает герой."
         return text
 
+    def combat_hp_summary(self, state: dict) -> str:
+        if not state.get("combat"):
+            return ""
+        rows = ["\n<b>Состояние боя</b>"]
+        for mid, monster in state["monsters"].items():
+            if not monster.get("dead"):
+                rows.append(f"👹 {html.escape(monster['name'])}: {self.hp_bar(monster['hp'], monster['max_hp'])} "
+                            f"{monster['hp']}/{monster['max_hp']} HP · КД {monster['ac']}")
+        for player in state["players"].values():
+            char = player.get("char")
+            if char and player.get("active", True):
+                rows.append(f"🧙 {html.escape(char['name'])}: {self.hp_bar(char['hp'], char['max_hp'])} "
+                            f"{char['hp']}/{char['max_hp']} HP")
+        return "\n".join(rows)
+
     def monsters_note(self, state: dict, monsters: list[dict]) -> str:
         alive = [m for m in monsters if not state["monsters"].get(m["key"][2:], {}).get("dead")]
         if not alive or not state["combat"]:
@@ -464,6 +488,9 @@ class DndBot:
                 if result is None:
                     return
                 await self.send_gm(chat_id, result[0], result[1])
+                hp_summary = self.combat_hp_summary(state)
+                if hp_summary:
+                    await self.send(chat_id, hp_summary)
                 continue
             player_key = entry["key"][2:]
             char = state["players"][player_key]["char"]
@@ -476,12 +503,12 @@ class DndBot:
             await self.send(
                 chat_id,
                 f"⚔️ Раунд {combat['round']}. Ход: <b>{html.escape(char['name'])}</b> ({mention(player_key, name)}), "
-                f"❤️ {char['hp']}/{char['max_hp']}. У тебя {state['timeout']} сек.")
+                f"❤️ {char['hp']}/{char['max_hp']}. У тебя {self.timeout_label(state.get('combat_timeout', state['timeout']))}.")
             if state["pending"].get(player_key):
                 # Игрок заявил действие заранее — разыгрываем сразу после выхода из лока
                 asyncio.create_task(self.combat_turn(chat_id, player_key, state["pending"][player_key]))
             else:
-                self.arm_timer(chat_id, state["timeout"])
+                self.arm_timer(chat_id, state.get("combat_timeout", state["timeout"]))
             return
 
     # --- обработчики ---
@@ -504,6 +531,7 @@ class DndBot:
         r.message.register(self.cmd_join, Command("join"))
         r.message.register(self.cmd_sheet, Command("sheet"))
         r.message.register(self.cmd_status, Command("status"))
+        r.message.register(self.cmd_settings, Command("settings"))
         r.message.register(self.cmd_go, Command("go"))
         r.message.register(self.cmd_pause, Command("pause", "resume"))
         r.message.register(self.cmd_endgame, Command("endgame"))
@@ -566,12 +594,14 @@ class DndBot:
             state["thread_id"] = thread_id
             if old:
                 state["timeout"] = old.get("timeout", 120)
+                state["combat_timeout"] = old.get("combat_timeout", state["timeout"])
+                state["turn_label"] = old.get("turn_label", "")
             self.states[chat_id] = state
             await self.save(chat_id)
         logging.info(f"ДнД: новая партия в чате {chat_id}" + (f", топик {thread_id}" if thread_id else ""))
         title = f"«{SCENARIOS[scenario]['title']}»" if scenario else "свободная импровизация"
         await self.send(chat_id, f"🎲 Новая партия: <b>{html.escape(title)}</b>\n<i>{html.escape(setting)}</i>\n\n"
-                                 "Каждый игрок — /join, бот проведёт по созданию героя. Когда все готовы — /go.")
+                                 "Каждый игрок — /join, бот проведёт по созданию героя. Настроить таймауты — /settings. Когда все готовы — /go.")
 
     async def cmd_here(self, message: Message):
         state = await self.get(message.chat.id)
@@ -779,16 +809,44 @@ class DndBot:
             return
         await message.answer(rules.sheet_text(chars[0]), parse_mode="HTML")
 
+    @staticmethod
+    def hp_bar(hp: int, max_hp: int, width: int = 10) -> str:
+        ratio = max(0, min(1, hp / max(max_hp, 1)))
+        filled = round(ratio * width)
+        return f"[{'█' * filled}{'░' * (width - filled)}]"
+
     async def cmd_status(self, message: Message):
         state = await self.get(message.chat.id)
         if not state:
             await message.answer("Партии нет. /newgame")
             return
         status = {"lobby": "сбор партии", "active": "идёт", "paused": "на паузе", "ended": "окончена"}
-        lines = [f"<b>Партия {status.get(state['status'], state['status'])}</b>, раунд {state['round']}, "
-                 f"таймаут {state['timeout']} сек."]
+        lines = [f"<b>Партия {status.get(state['status'], state['status'])}</b>, раунд {state['round']}.",
+                 f"⏱ Исследование: {self.timeout_label(state.get('timeout', 120))}; бой: "
+                 f"{self.timeout_label(state.get('combat_timeout', state.get('timeout', 120)))}."]
         if state["scene"]:
             lines.append(f"📍 {html.escape(state['scene'])}")
+        if state["status"] == "lobby":
+            lines.append("⚙️ Настроить партию: /settings")
+        elif state["status"] == "active":
+            if state["combat"]:
+                actor = current_actor(state)
+                if actor and actor["key"].startswith("p:"):
+                    player_key = actor["key"][2:]
+                    player = state["players"].get(player_key, {})
+                    lines.append(f"⏳ Ждём ход: {html.escape(actor['name'])} "
+                                 f"({mention(player_key, player.get('name', 'игрок'))}).")
+                else:
+                    lines.append("⚔️ Сейчас ходят монстры; ведущий обрабатывает их действия.")
+            elif state["pending"]:
+                waiting = [p["char"]["name"] for k, p in state["players"].items()
+                           if p.get("char") and p.get("active", True) and can_act(p["char"]) and k not in state["pending"]]
+                lines.append("⏳ Ведущий собирает заявки." +
+                             (f" Ждёт: {html.escape(', '.join(waiting))}." if waiting else " Все заявились; скоро ответ."))
+            else:
+                lines.append("⏳ Ведущий ждёт заявок игроков.")
+            if state.get("turn_label"):
+                lines.append(f"🎬 {html.escape(state['turn_label'])}")
         for key, player in state["players"].items():
             char = player.get("char")
             if not char:
@@ -806,7 +864,8 @@ class DndBot:
             lines.append(f"⚔️ Бой, раунд {state['combat']['round']}, ходит: {html.escape(entry['name'] if entry else '?')}")
             for mid, m in state["monsters"].items():
                 if not m.get("dead"):
-                    lines.append(f"  👹 {html.escape(m['name'])}: {m['hp']}/{m['max_hp']}")
+                    lines.append(f"  👹 {html.escape(m['name'])}: {self.hp_bar(m['hp'], m['max_hp'])} "
+                                 f"{m['hp']}/{m['max_hp']} HP · КД {m['ac']}")
         await message.answer("\n".join(lines), parse_mode="HTML")
 
     async def cmd_go(self, message: Message):
@@ -973,14 +1032,50 @@ class DndBot:
         state = await self.get(message.chat.id)
         if not state:
             return
-        try:
-            seconds = int(command.args)
-        except (TypeError, ValueError):
-            await message.answer(f"Сейчас {state['timeout']} сек. Поменять: /timeout 180")
+        args = (command.args or "").lower().split()
+        if not args:
+            await message.answer(f"Исследование: {self.timeout_label(state.get('timeout', 120))}; бой: "
+                                 f"{self.timeout_label(state.get('combat_timeout', state.get('timeout', 120)))}. "
+                                 "Формат: /timeout 300 [explore|combat], /timeout off [explore|combat].")
             return
-        state["timeout"] = max(20, min(seconds, 3600))
+        phase = args[1] if len(args) > 1 else "both"
+        fields = {"explore": ("timeout",), "combat": ("combat_timeout",), "both": ("timeout", "combat_timeout")}
+        if phase not in fields:
+            await message.answer("Режим: explore или combat.")
+            return
+        try:
+            seconds = None if args[0] in ("off", "0") else max(20, min(int(args[0]), 3600))
+        except ValueError:
+            await message.answer("Формат: /timeout 300 или /timeout off [explore|combat].")
+            return
+        for field in fields[phase]:
+            state[field] = seconds
+        active_timeout = state.get("combat_timeout", state.get("timeout", 120)) if state["combat"] else state.get("timeout", 120)
+        if state["status"] == "active" and (state["combat"] or state["pending"]):
+            if active_timeout:
+                self.arm_timer(message.chat.id, active_timeout)
+            else:
+                self.cancel_timer(message.chat.id)
         await self.save(message.chat.id)
-        await message.answer(f"⏱ Ждём заявки {state['timeout']} сек.")
+        await message.answer(f"⏱ Исследование: {self.timeout_label(state['timeout'])}; бой: "
+                             f"{self.timeout_label(state['combat_timeout'])}.")
+
+    @staticmethod
+    def timeout_label(seconds: int | None) -> str:
+        return f"{seconds} сек." if seconds else "выключен"
+
+    async def cmd_settings(self, message: Message):
+        state = await self.get(message.chat.id)
+        if not state:
+            await message.answer("Сначала /newgame.")
+            return
+        if state['status'] != 'lobby':
+            await message.answer("Настройки перед игрой доступны в лобби. Во время игры: /timeout.")
+            return
+        await message.answer(f"⚙️ Исследование: {self.timeout_label(state.get('timeout', 120))}; бой: "
+                             f"{self.timeout_label(state.get('combat_timeout', state.get('timeout', 120)))}.\n"
+                             "/timeout 300 — оба режима; /timeout off — без автопропусков.\n"
+                             "/timeout 300 combat — только бой. Запустите /go, когда будете готовы.")
 
     async def cmd_leave(self, message: Message):
         state = await self.get(message.chat.id)
@@ -1086,8 +1181,8 @@ class DndBot:
         waiting = [k for k, c in characters(state).items() if can_act(c) and k not in state["pending"]]
         if not waiting:
             await self.resolve_round(chat_id)
-        elif chat_id not in self.timers:
-            self.arm_timer(chat_id, state["timeout"])
+        elif chat_id not in self.timers and state.get("timeout", 120):
+            self.arm_timer(chat_id, state.get("timeout", 120))
 
     # --- запуск ---
 

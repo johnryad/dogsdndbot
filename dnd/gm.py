@@ -174,6 +174,8 @@ def new_state(setting: str, scenario: str | None = None) -> dict:
         "monsters": {},
         "round": 0,
         "timeout": 120,
+        "combat_timeout": 120,
+        "turn_label": "",
     }
 
 
