@@ -1,6 +1,8 @@
 """Telegram-обвязка ДнД-ведущего: команды, сбор заявок, таймеры, очередь боя."""
 import os
 import re
+import secrets
+import time
 import html
 import json
 import hashlib
@@ -45,6 +47,7 @@ COMMANDS = [
     ("here", "перенести игру в этот топик"),
     ("timeout", "таймауты: /timeout 300 или off"),
     ("endgame", "эпилог и конец партии"),
+    ("wipe", "сбросить прогресс чата (2 подтверждения)"),
     ("help", "все команды"),
 ]
 
@@ -57,9 +60,10 @@ FAIL_GM = [
 HELP = """<b>ДнД-ведущий — команды</b>
 
 <b>Партия</b>
-/newgame — новая партия: 6 сценариев кнопками или свой мир (<code>/newgame мир и тон</code>)
+/newgame — новая партия: 11 приключений кнопками или свой мир (<code>/newgame мир и тон</code>)
 /go — начать приключение; потом — ведущий отвечает, не дожидаясь остальных
 /settings — настройки до игры; /pause — пауза и продолжить, /endgame — эпилог и конец
+/wipe — удалить прогресс этого чата (требует двух подтверждений администратора)
 /here — перенести игру в этот топик (партия живёт в топике, где сделали /newgame)
 
 <b>Герой</b>
@@ -131,6 +135,7 @@ class DndBot:
         self.states: dict[int, dict] = {}
         self.locks: dict[int, asyncio.Lock] = {}
         self.timers: dict[int, asyncio.Task] = {}
+        self.wipe_confirmations: dict[str, tuple[int, int, dict[int, tuple[tuple[str, str], ...]], float]] = {}
         self.router = Router()
         self._register()
         self.dp.include_router(self.router)
@@ -535,6 +540,7 @@ class DndBot:
         r.message.register(self.cmd_go, Command("go"))
         r.message.register(self.cmd_pause, Command("pause", "resume"))
         r.message.register(self.cmd_endgame, Command("endgame"))
+        r.message.register(self.cmd_wipe, Command("wipe"))
         r.message.register(self.cmd_roll, Command("roll", "r"))
         r.message.register(self.cmd_timeout, Command("timeout"))
         r.message.register(self.cmd_leave, Command("leave"))
@@ -549,6 +555,7 @@ class DndBot:
         r.callback_query.register(self.on_stats, F.data.startswith("st:"))
         r.callback_query.register(self.on_ability, F.data.startswith("ab:"))
         r.callback_query.register(self.on_endgame, F.data.startswith("end:"))
+        r.callback_query.register(self.on_wipe, F.data.startswith("wipe:"))
 
     async def cmd_help(self, message: Message):
         await message.answer(HELP, parse_mode="HTML")
@@ -908,6 +915,98 @@ class DndBot:
             elif state["pending"]:
                 self.arm_timer(message.chat.id, state["timeout"])
         await self.save(message.chat.id)
+
+    async def cmd_wipe(self, message: Message):
+        chat_id = message.chat.id
+        if message.chat.type == "private":
+            await message.answer("Сброс доступен только в группе.")
+            return
+        try:
+            member = await self.bot.get_chat_member(chat_id, message.from_user.id)
+        except Exception:
+            await message.answer("Не удалось проверить права администратора.")
+            return
+        if member.status not in ("creator", "administrator"):
+            await message.answer("Сбрасывать прогресс могут только администраторы чата.")
+            return
+        state = await self.get(chat_id)
+        if not state:
+            await message.answer("В этом чате нет сохранённой партии.")
+            return
+        token = secrets.token_hex(4)
+        scenario = SCENARIOS.get(state.get("scenario") or {})
+        scenario_title = scenario["title"] if scenario else "свой мир"
+        archived_heroes = {
+            int(uid): tuple(
+                (player["char"]["name"], scenario_title)
+                for player in [state.get("players", {}).get(uid, {})]
+                if player.get("char", {}).get("archived")
+            )
+            for uid in state.get("players", {})
+        }
+        self.wipe_confirmations[token] = (chat_id, message.from_user.id, archived_heroes, time.monotonic() + 60)
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Продолжить", callback_data=f"wipe:1:{token}"),
+            InlineKeyboardButton(text="Отмена", callback_data=f"wipe:cancel:{token}"),
+        ]])
+        await message.answer(
+            "⚠️ Сброс удалит партию и журнал этого чата, а также архивные записи героев из этой партии. "
+            "На первом шаге нажмите «Продолжить», чтобы перейти ко второму подтверждению.",
+            reply_markup=kb,
+        )
+
+    async def on_wipe(self, query: CallbackQuery):
+        parts = query.data.split(":")
+        stage, token = parts[1], parts[2]
+        pending = self.wipe_confirmations.get(token)
+        if not pending:
+            await query.answer("Подтверждение истекло.", show_alert=True)
+            return
+        chat_id, owner_id, archived_heroes, expires = pending
+        if query.from_user.id != owner_id or query.message.chat.id != chat_id:
+            await query.answer("Это подтверждение создано другим администратором.", show_alert=True)
+            return
+        try:
+            member = await self.bot.get_chat_member(chat_id, query.from_user.id)
+        except Exception:
+            await query.answer("Не удалось проверить права администратора.", show_alert=True)
+            return
+        if member.status not in ("creator", "administrator"):
+            self.wipe_confirmations.pop(token, None)
+            await query.answer("Нужны права администратора.", show_alert=True)
+            return
+        if time.monotonic() > expires:
+            self.wipe_confirmations.pop(token, None)
+            await query.answer("Время подтверждения истекло.", show_alert=True)
+            return
+        if stage == "cancel":
+            self.wipe_confirmations.pop(token, None)
+            await query.answer()
+            await query.message.edit_text("Сброс отменён.")
+            return
+        if stage == "1":
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="ДА, УДАЛИТЬ ВСЁ", callback_data=f"wipe:2:{token}"),
+                InlineKeyboardButton(text="Отмена", callback_data=f"wipe:cancel:{token}"),
+            ]])
+            await query.answer()
+            await query.message.edit_text(
+                "Последнее подтверждение: будут удалены текущая партия, журнал и архивные записи героев именно этой партии. "
+                "Восстановить их нельзя.",
+                reply_markup=kb,
+            )
+            return
+        if stage != "2":
+            await query.answer("Некорректный шаг.", show_alert=True)
+            return
+        self.wipe_confirmations.pop(token, None)
+        await query.answer()
+        await query.message.edit_reply_markup(reply_markup=None)
+        async with self.lock(chat_id):
+            self.cancel_timer(chat_id)
+            await self.storage.wipe_chat(chat_id, archived_heroes)
+            self.states.pop(chat_id, None)
+        await query.message.edit_text("🧹 Прогресс этого чата удалён. Можно начать заново командой /newgame.")
 
     async def cmd_endgame(self, message: Message):
         state = await self.get(message.chat.id)

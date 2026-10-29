@@ -321,9 +321,12 @@ def test_full_scenario(monkeypatch):
 
 
 def test_scenarios():
-    assert len(SCENARIOS) == 5
+    assert len(SCENARIOS) == 11
+    levels = {sc.get("level") for sc in SCENARIOS.values()}
+    assert {"1–2", "2–3", "3–4", "4–5", "6–8", "9–11", "12–15", "16–20"} <= levels
     for key, sc in SCENARIOS.items():
         assert len(sc["acts"]) == 4 and sc["monsters"] and sc["hook"]
+        assert sc.get("level") and sc.get("rewards")
         for act in (1, 3):
             block = scenario_block({"scenario": key, "act": act, "plot_notes": []})
             assert "▶ ТЕКУЩИЙ" in block and sc["acts"][act - 1]["details"] in block
