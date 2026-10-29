@@ -1,0 +1,5 @@
+.git
+.env
+*.sqlite3
+__pycache__
+tests
