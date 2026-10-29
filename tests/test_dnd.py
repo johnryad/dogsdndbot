@@ -32,6 +32,7 @@ class FakeSession(BaseSession):
     def __init__(self):
         super().__init__()
         self.sent: list[str] = []
+        self.threads: list[int | None] = []
         self.next_id = 1000
         self.webhook = None
 
@@ -44,6 +45,7 @@ class FakeSession(BaseSession):
         if name in ("SendMessage", "EditMessageText"):
             self.next_id += 1
             self.sent.append(method.text)
+            self.threads.append(getattr(method, "message_thread_id", None))
             return Message(message_id=self.next_id, date=datetime.datetime.now(),
                            chat=Chat(id=CHAT_ID, type="supergroup"), text=method.text)
         return True
@@ -114,7 +116,7 @@ class Harness:
         await self.dnd.storage.connect()
         await self.dnd.restore()
 
-    async def say(self, user: User, text: str):
+    async def say(self, user: User, text: str, thread: int | None = None):
         self.update_id += 1
         self.message_id += 1
         entities = None
@@ -124,19 +126,21 @@ class Harness:
             "update_id": self.update_id,
             "message": {"message_id": self.message_id, "date": int(datetime.datetime.now().timestamp()),
                         "chat": {"id": CHAT_ID, "type": "supergroup", "title": "Подземелье"},
-                        "from": user.model_dump(), "text": text, "entities": entities},
+                        "from": user.model_dump(), "text": text, "entities": entities,
+                        "message_thread_id": thread, "is_topic_message": bool(thread) or None},
         }, context={"bot": self.dnd.bot})
         await self.dnd.dp.feed_update(self.dnd.bot, update)
         await asyncio.sleep(0.01)
 
-    async def click(self, user: User, data: str):
+    async def click(self, user: User, data: str, thread: int | None = None):
         self.update_id += 1
         update = Update.model_validate({
             "update_id": self.update_id,
             "callback_query": {
                 "id": str(self.update_id), "from": user.model_dump(), "chat_instance": "x", "data": data,
                 "message": {"message_id": 1, "date": int(datetime.datetime.now().timestamp()),
-                            "chat": {"id": CHAT_ID, "type": "supergroup"}, "text": "кнопки"},
+                            "chat": {"id": CHAT_ID, "type": "supergroup"}, "text": "кнопки",
+                            "message_thread_id": thread, "is_topic_message": bool(thread) or None},
             },
         }, context={"bot": self.dnd.bot})
         await self.dnd.dp.feed_update(self.dnd.bot, update)
@@ -450,5 +454,47 @@ def test_webhook():
             await asyncio.sleep(0.2)
             assert "Похмелье в Гнилом Броде" in h.last()
             assert (await client.get("/")).status == 404  # health-эндпоинт добавляет main.py
+
+    asyncio.run(scenario())
+
+
+def test_topics():
+    """Партия живёт в топике, где сделали /newgame; другие топики бот не читает."""
+    GAME, CHATTER = 7, 9
+
+    async def scenario():
+        h = Harness(os.path.join(tempfile.mkdtemp(), "dnd.sqlite3"))
+        await h.start()
+        await h.say(VASYA, "/newgame", GAME)
+        assert h.session.threads[-1] == GAME  # ответ на команду — в тот же топик
+        await h.click(VASYA, "ng:heist", GAME)
+        assert h.state["thread_id"] == GAME and h.session.threads[-1] == GAME
+
+        # Из чужого топика команды и заявки не работают
+        await h.say(VASYA, "/join Торин", CHATTER)
+        assert "11" not in h.state["players"]
+        # А /newgame подскажет, где игра
+        await h.say(VASYA, "/newgame", CHATTER)
+        assert "другом топике" in h.last() and h.session.threads[-1] == CHATTER
+
+        await h.say(VASYA, "/join Торин", GAME)
+        await h.click(VASYA, "cls:11:random", GAME)
+        await h.say(VASYA, "-", GAME)
+        await h.say(VASYA, "-", GAME)
+        await h.say(VASYA, "/go", GAME)
+        assert h.state["status"] == "active"
+        # Все сообщения ведущего (включая ответ ИИ) — только в топике игры
+        assert all(t == GAME for t in h.session.threads[-3:])
+
+        await h.say(VASYA, "обыскиваю сейф", CHATTER)
+        assert h.state["pending"] == {}
+
+        # /here переносит игру
+        await h.say(VASYA, "/here", CHATTER)
+        assert h.state["thread_id"] == CHATTER and h.session.threads[-1] == CHATTER
+        await h.say(VASYA, "обыскиваю сейф", CHATTER)
+        assert h.state["pending"] == {}  # единственный игрок заявился — ход разыгран
+        assert h.session.threads[-1] == CHATTER
+        await h.dnd.storage.close()
 
     asyncio.run(scenario())

@@ -41,6 +41,7 @@ COMMANDS = [
     ("back", "вернуться в партию"),
     ("afk", "отметить отошедшего: /afk Имя"),
     ("pause", "пауза / продолжить"),
+    ("here", "перенести игру в этот топик"),
     ("timeout", "сколько ждать заявки, сек"),
     ("endgame", "эпилог и конец партии"),
     ("help", "все команды"),
@@ -58,6 +59,7 @@ HELP = """<b>ДнД-ведущий — команды</b>
 /newgame — новая партия: 5 сценариев кнопками или свой мир (<code>/newgame мир и тон</code>)
 /go — начать приключение; потом — ведущий отвечает, не дожидаясь остальных
 /pause — пауза и продолжить, /endgame — эпилог и конец
+/here — перенести игру в этот топик (партия живёт в топике, где сделали /newgame)
 
 <b>Герой</b>
 /join — создать героя, бот проведёт по шагам
@@ -102,6 +104,17 @@ def mention(player_key: str, name: str) -> str:
     return f'<a href="tg://user?id={player_key}">{html.escape(name)}</a>'
 
 
+def topic_of(message: Message | None) -> int | None:
+    """Топик форума, откуда сообщение; None — основной чат или топик «General»."""
+    if message and getattr(message, "is_topic_message", False):
+        return message.message_thread_id
+    return None
+
+
+# Команды, которые работают из любого топика, даже когда партия привязана к другому
+ANY_TOPIC_COMMANDS = {"/newgame", "/here", "/help", "/start"}
+
+
 def clean_name(name: str) -> str:
     name = re.sub(r"[<>&\"*_`\[\]]", "", name or "").strip()
     return name[:40]
@@ -142,7 +155,14 @@ class DndBot:
     def allowed(self, chat_id: int) -> bool:
         return not self.allowed_chats or chat_id in self.allowed_chats
 
+    def thread(self, chat_id: int) -> int | None:
+        return (self.states.get(chat_id) or {}).get("thread_id")
+
     async def send(self, chat_id: int, text: str, **kwargs):
+        # Всё, что пишет ведущий, уходит в топик партии
+        thread = self.thread(chat_id)
+        if thread:
+            kwargs.setdefault("message_thread_id", thread)
         for chunk in split_message(text):
             await self.bot.send_message(chat_id, chunk, parse_mode="HTML", disable_web_page_preview=True, **kwargs)
 
@@ -214,7 +234,7 @@ class DndBot:
         """Ход ведущего с откатом состояния, если ИИ упал посреди хода."""
         snapshot = json.loads(json.dumps(state))
         try:
-            await self.bot.send_chat_action(chat_id, "typing")
+            await self.bot.send_chat_action(chat_id, "typing", message_thread_id=self.thread(chat_id))
         except Exception:
             pass
         try:
@@ -466,9 +486,20 @@ class DndBot:
 
     # --- обработчики ---
 
+    async def topic_guard(self, handler, message: Message, data: dict):
+        """Партия живёт в одном топике: сообщения из других топиков бот не видит."""
+        state = await self.get(message.chat.id) if self.allowed(message.chat.id) else None
+        if state and state["status"] != "ended" and "thread_id" in state and topic_of(message) != state["thread_id"]:
+            command = (message.text or "").split(maxsplit=1)[0].split("@")[0].lower() if message.text else ""
+            if command not in ANY_TOPIC_COMMANDS:
+                return None
+        return await handler(message, data)
+
     def _register(self):
         r = self.router
+        r.message.middleware(self.topic_guard)
         r.message.register(self.cmd_help, Command("help", "start"))
+        r.message.register(self.cmd_here, Command("here"))
         r.message.register(self.cmd_newgame, Command("newgame"))
         r.message.register(self.cmd_join, Command("join"))
         r.message.register(self.cmd_sheet, Command("sheet"))
@@ -499,10 +530,13 @@ class DndBot:
             return
         state = await self.get(message.chat.id)
         if state and state["status"] in ("lobby", "active", "paused"):
-            await message.answer("Партия уже идёт. Сначала /endgame — похороним эту как следует.")
+            if "thread_id" in state and topic_of(message) != state["thread_id"]:
+                await message.answer("Партия уже идёт в другом топике. Перенести её сюда — /here.")
+            else:
+                await message.answer("Партия уже идёт. Сначала /endgame — похороним эту как следует.")
             return
         if command.args:
-            await self.create_game(message.chat.id, command.args.strip()[:500])
+            await self.create_game(message.chat.id, command.args.strip()[:500], thread_id=topic_of(message))
             return
         lines = ["<b>Выбирайте сценарий:</b>"]
         for i, sc in enumerate(SCENARIOS.values(), 1):
@@ -521,20 +555,32 @@ class DndBot:
             return
         await query.answer()
         await query.message.edit_reply_markup(reply_markup=None)
-        await self.create_game(query.message.chat.id, SCENARIOS[key]["setting"], key)
+        await self.create_game(query.message.chat.id, SCENARIOS[key]["setting"], key, topic_of(query.message))
 
-    async def create_game(self, chat_id: int, setting: str, scenario: str | None = None):
+    async def create_game(self, chat_id: int, setting: str, scenario: str | None = None,
+                          thread_id: int | None = None):
         async with self.lock(chat_id):
             old = await self.get(chat_id)
             state = new_state(setting, scenario)
+            # Партия привязывается к топику, где её начали
+            state["thread_id"] = thread_id
             if old:
                 state["timeout"] = old.get("timeout", 120)
             self.states[chat_id] = state
             await self.save(chat_id)
-        logging.info(f"ДнД: новая партия в чате {chat_id}")
+        logging.info(f"ДнД: новая партия в чате {chat_id}" + (f", топик {thread_id}" if thread_id else ""))
         title = f"«{SCENARIOS[scenario]['title']}»" if scenario else "свободная импровизация"
         await self.send(chat_id, f"🎲 Новая партия: <b>{html.escape(title)}</b>\n<i>{html.escape(setting)}</i>\n\n"
                                  "Каждый игрок — /join, бот проведёт по созданию героя. Когда все готовы — /go.")
+
+    async def cmd_here(self, message: Message):
+        state = await self.get(message.chat.id)
+        if not state or state["status"] == "ended":
+            await message.answer("Партии нет. /newgame — начать её здесь.")
+            return
+        state["thread_id"] = topic_of(message)
+        await self.save(message.chat.id)
+        await self.send(message.chat.id, "📍 Партия теперь живёт в этом топике. Остальные топики ведущий не читает.")
 
     async def cmd_join(self, message: Message, command: CommandObject):
         state = await self.get(message.chat.id)
