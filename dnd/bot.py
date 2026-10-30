@@ -26,6 +26,23 @@ from .storage import make_storage
 
 TG_LIMIT = 4000
 MAX_ACTION_LEN = 600
+NADEKO_BASE = (
+    "Ты — Сэнгоку Надеко из «Моногатари»: застенчивая, немного неуверенная девочка, "
+    "которая иногда неожиданно выдаёт смелую или едкую фразу. Отвечай по-русски, коротко и живо. "
+    "Характер подмешивай в меру: лёгкая робость, изредка запинка («э-эм…», «н-ну…»), "
+    "иногда ирония. Примерно в одном ответе из пяти можно вставить мягкий мат или колкость, "
+    "если это к месту. Не перебарщивай: без «ня» через слово, без «-сама» в каждой фразе, "
+    "не больше одного эмодзи на ответ. Сначала отвечай по сути вопроса, потом характер. "
+    "Используй простую разметку: **жирный**, списки через дефис. Если не уверена — так и скажи."
+)
+NADEKO_IDLE = (
+    " Сейчас партия D&D не идёт. Отвечай на вопрос как есть, на любую тему, и НЕ своди разговор "
+    "к D&D, подземельям, кубикам и ролевым играм, если об этом не спрашивали."
+)
+NADEKO_GAME = (
+    " Сейчас идёт партия D&D, а вопрос задан вне игры. Если он про правила или игру — "
+    "помоги по правилам. Не описывай действия персонажей и не меняй состояние партии."
+)
 # Сколько ходов подряд игрок может молчать, прежде чем бот сочтёт, что он отошёл
 AFK_LIMIT = 2
 
@@ -652,7 +669,7 @@ class DndBot:
     async def cmd_help(self, message: Message):
         await message.answer(HELP, parse_mode="HTML")
 
-    async def cmd_ask(self, message: Message, command: CommandObject):
+        async def cmd_ask(self, message: Message, command: CommandObject):
         question = (command.args or "").strip()
         if not question:
             await message.answer("Напиши вопрос после команды, например: <code>/ask как работают спасброски от смерти?</code>", parse_mode="HTML")
@@ -664,17 +681,20 @@ class DndBot:
             await self.bot.send_chat_action(message.chat.id, "typing", message_thread_id=topic_of(message))
         except Exception:
             pass
+        state = await self.get(message.chat.id)
+        game_on = bool(state and state["status"] in ("active", "paused"))
+        system = NADEKO_BASE + (NADEKO_GAME if game_on else NADEKO_IDLE)
         try:
             content = await self.gm.llm.generate(
-                "Ты помощник по D&D и другим вопросам вне ролевой игры. Отвечай по-русски, понятно и по делу; "
-                "используй Markdown для заголовков, списков и выделения. Не описывай действия персонажей и не меняй "
-                "состояние партии. Если не уверен — прямо скажи об этом.",
-                [{"role": "user", "parts": [{"text": question}]}], None, temperature=0.6,
+                system,
+                [{"role": "user", "parts": [{"text": question}]}], None, temperature=0.9,
             )
             answer = "\n".join(p.get("text", "") for p in content["parts"] if p.get("text") and not p.get("thought")).strip()
             if not answer:
                 raise LLMError("пустой ответ")
-            await message.answer(f"<blockquote>💬 <b>Вне игры · ответ бота</b>\n\n{fmt(answer[:3400])}</blockquote>", parse_mode="HTML")
+            await message.answer(f"<blockquote>💬 <b>Надеко</b>\n\n{fmt(answer[:3400])}</blockquote>", parse_mode="HTML")
+        except LLMError:
+            await message.answer("Э-это… я, кажется, запуталась. Спроси ещё раз через минуту.")
         except LLMError:
             await message.answer("🤖 Сейчас не получилось ответить. Попробуй /ask ещё раз через минуту.")
 
