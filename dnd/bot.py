@@ -14,7 +14,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, FSInputFile
 
 from . import rules
 from .dice import roll, DiceError
@@ -61,7 +61,7 @@ FAIL_GM = [
 HELP = """<b>ДнД-ведущий — команды</b>
 
 <b>Партия</b>
-/newgame — новая партия: 11 приключений кнопками или свой мир (<code>/newgame мир и тон</code>)
+/newgame — выбрать приключение и посмотреть его карточку или создать свой мир (<code>/newgame мир и тон</code>)
 /go — начать приключение; потом — ведущий отвечает, не дожидаясь остальных
 /settings — настройки до игры; /pause — пауза и продолжить, /endgame — эпилог и конец
 /wipe — удалить партию, журнал и все прошлые записи героев участников во всех кампаниях (2 подтверждения администратора)
@@ -293,7 +293,7 @@ class DndBot:
         """Вне боя: ведущий отвечает на все заявки разом."""
         async with self.lock(chat_id):
             state = await self.get(chat_id)
-            if not state or state["status"] != "active" or state["combat"]:
+            if not state or state["status"] != "active" or state["combat"] or state.get("vote"):
                 return
             self.cancel_timer(chat_id)
             pending = state["pending"]
@@ -321,6 +321,9 @@ class DndBot:
                 return
             text, log, combat_started = result
             await self.send_gm(chat_id, text, log)
+            if state.get("vote"):
+                await self.save(chat_id)
+                await self.show_vote(chat_id, state['vote'])
             for key in silent_keys:
                 await self.count_missed(chat_id, state, key)
             if combat_started and state["combat"]:
@@ -540,6 +543,7 @@ class DndBot:
         r = self.router
         r.message.middleware(self.topic_guard)
         r.message.register(self.cmd_help, Command("help", "start"))
+        r.message.register(self.cmd_vote, Command("vote"))
         r.message.register(self.cmd_here, Command("here"))
         r.message.register(self.cmd_newgame, Command("newgame"))
         r.message.register(self.cmd_join, Command("join"))
@@ -560,12 +564,90 @@ class DndBot:
         r.message.register(self.cmd_log, Command("log"))
         r.message.register(self.on_text, F.text)
         r.callback_query.register(self.on_setting, F.data.startswith("ng:"))
+        r.callback_query.register(self.on_scenario_confirm, F.data.startswith("startsc:"))
+        r.callback_query.register(self.on_vote, F.data.startswith("vote:"))
         r.callback_query.register(self.on_class, F.data.startswith("cls:"))
         r.callback_query.register(self.on_race, F.data.startswith("race:"))
         r.callback_query.register(self.on_stats, F.data.startswith("st:"))
         r.callback_query.register(self.on_ability, F.data.startswith("ab:"))
         r.callback_query.register(self.on_endgame, F.data.startswith("end:"))
         r.callback_query.register(self.on_wipe, F.data.startswith("wipe:"))
+
+    async def cmd_vote(self, message: Message, command: CommandObject):
+        chat_id = message.chat.id
+        if not self.allowed(chat_id):
+            return
+        async with self.lock(chat_id):
+            state = await self.get(chat_id)
+            vote = state.get('vote') if state else None
+            key = str(message.from_user.id)
+            if not vote or key not in characters(state) or not can_act(characters(state)[key]):
+                await message.answer('Нет доступного голосования.')
+                return
+            if (command.args or '').strip().lower() == 'cancel':
+                state['vote'] = None
+                await self.save(chat_id)
+                await message.answer('Голосование отменено. Обсудите решение и продолжайте игру.')
+            else:
+                await self.show_vote(chat_id, vote)
+
+    async def show_vote(self, chat_id: int, vote: dict):
+        buttons = [[InlineKeyboardButton(text=option, callback_data=f"vote:{vote['id']}:{i}")]
+                   for i, option in enumerate(vote['options'])]
+        await self.send(chat_id, f"🗳 <b>{html.escape(vote['question'])}</b>\nКаждый активный игрок выбирает вариант. При равенстве решит d20.",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+    async def on_vote(self, query: CallbackQuery):
+        chat_id = query.message.chat.id
+        if not self.allowed(chat_id):
+            await query.answer("Голосование недоступно")
+            return
+        parts = query.data.split(":")
+        if len(parts) != 3 or not parts[2].isdigit():
+            await query.answer("Кнопка недействительна")
+            return
+        ready = False
+        async with self.lock(chat_id):
+            state = await self.get(chat_id)
+            vote = state.get("vote") if state else None
+            key = str(query.from_user.id)
+            choice = int(parts[2])
+            if not vote or state['status'] != 'active' or topic_of(query.message) != state.get('thread_id') or vote['id'] != parts[1] or choice >= len(vote['options']):
+                await query.answer("Голосование уже завершено")
+                return
+            if key not in vote['voters'] or key not in characters(state) or not can_act(characters(state)[key]):
+                await query.answer("Голосуют активные участники партии")
+                return
+            if key in vote['votes']:
+                await query.answer("Ваш голос уже учтён")
+                return
+            vote['votes'][key] = choice
+            eligible = [k for k in vote['voters'] if k in characters(state) and can_act(characters(state)[k])]
+            if all(k in vote['votes'] for k in eligible):
+                counts = [sum(1 for k in eligible if vote['votes'].get(k) == i) for i in range(len(vote['options']))]
+                tied = [i for i, count in enumerate(counts) if count == max(counts)]
+                lines = ["🗳 <b>Результаты голосования</b>"]
+                for i, option in enumerate(vote['options']):
+                    names = [state['players'][k]['char']['name'] for k in eligible if vote['votes'].get(k) == i]
+                    lines.append(f"{html.escape(option)}: {counts[i]} — {html.escape(', '.join(names) or 'нет голосов')}")
+                while len(tied) > 1:
+                    rolls = {i: roll('1d20').total for i in tied}
+                    lines.append('🎲 ' + '; '.join(f"{html.escape(vote['options'][i])}: {rolls[i]}" for i in tied))
+                    high = max(rolls.values())
+                    tied = [i for i in tied if rolls[i] == high]
+                winner = vote['options'][tied[0]]
+                lines.append(f"<b>Выбрано: {html.escape(winner)}</b>")
+                state['vote'] = None
+                for player_key in eligible:
+                    state['pending'][player_key] = f"Группа уже проголосовала по вопросу «{vote['question']}»: выбран вариант «{winner}». Продолжи сюжет по решению без повторного голосования."
+                ready = True
+                await self.save(chat_id)
+                await self.send(chat_id, '\n'.join(lines))
+            else:
+                await self.save(chat_id)
+        await query.answer("Голос учтён")
+        if ready:
+            await self.resolve_round(chat_id)
 
     async def cmd_help(self, message: Message):
         await message.answer(HELP, parse_mode="HTML")
@@ -625,13 +707,37 @@ class DndBot:
             await query.answer("Поздно, партия уже создана")
             return
         await query.answer()
+        sc = SCENARIOS[key]
+        caption = (f"<b>{html.escape(sc['title'])}</b>\n"
+                   f"<b>Рекомендуемый уровень:</b> {html.escape(sc.get('level', '1'))}\n\n"
+                   f"{html.escape(sc['setting'])}\n\n<b>Завязка</b>\n{html.escape(sc['hook'])}")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Создать лобби", callback_data=f"startsc:{key}")
+        ]])
+        image_path = os.path.join(os.path.dirname(__file__), "images", f"{key}.png")
+        if os.path.isfile(image_path):
+            await query.message.answer_photo(FSInputFile(image_path), caption=caption, parse_mode="HTML", reply_markup=keyboard)
+        else:
+            await query.message.answer(caption, parse_mode="HTML", reply_markup=keyboard)
+
+    async def on_scenario_confirm(self, query: CallbackQuery):
+        key = query.data.split(":", 1)[1]
+        if key not in SCENARIOS or not self.allowed(query.message.chat.id):
+            await query.answer("Сценарий недоступен")
+            return
+        created = await self.create_game(query.message.chat.id, SCENARIOS[key]["setting"], key, topic_of(query.message))
+        if not created:
+            await query.answer("Партия уже создана")
+            return
+        await query.answer()
         await query.message.edit_reply_markup(reply_markup=None)
-        await self.create_game(query.message.chat.id, SCENARIOS[key]["setting"], key, topic_of(query.message))
 
     async def create_game(self, chat_id: int, setting: str, scenario: str | None = None,
                           thread_id: int | None = None):
         async with self.lock(chat_id):
             old = await self.get(chat_id)
+            if old and old["status"] in ("lobby", "active", "paused"):
+                return False
             state = new_state(setting, scenario)
             # Партия привязывается к топику, где её начали
             state["thread_id"] = thread_id
@@ -645,6 +751,7 @@ class DndBot:
         title = f"«{SCENARIOS[scenario]['title']}»" if scenario else "свободная импровизация"
         await self.send(chat_id, f"🎲 Новая партия: <b>{html.escape(title)}</b>\n<i>{html.escape(setting)}</i>\n\n"
                                  "Каждый игрок — /join, бот проведёт по созданию героя. Настроить таймауты — /settings. Когда все готовы — /go.")
+        return True
 
     async def cmd_here(self, message: Message):
         state = await self.get(message.chat.id)
@@ -1298,6 +1405,9 @@ class DndBot:
                 f"🩹 <b>{html.escape(char['name'])} без сознания</b> и сейчас не может действовать. "
                 "В бою бот автоматически бросает спасброски от смерти. Союзник может помочь или стабилизировать героя; "
                 "можно написать /status, спросить вне игры через /ask или дождаться следующего хода.", parse_mode="HTML")
+            return
+        if state.get('vote'):
+            await message.reply("🗳 Сначала проголосуйте кнопками. Если голосование нужно отменить — /vote cancel.")
             return
         text = text[:MAX_ACTION_LEN]
 

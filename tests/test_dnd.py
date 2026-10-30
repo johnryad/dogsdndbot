@@ -193,6 +193,8 @@ def test_full_scenario(monkeypatch):
         await h.say(VASYA, "/newgame")
         assert "Похмелье в Гнилом Броде" in h.last() and "Ограбление века" in h.last()
         await h.click(VASYA, "ng:hangover")
+        assert CHAT_ID not in h.dnd.states
+        await h.click(VASYA, "startsc:hangover")
         assert h.state["status"] == "lobby" and h.state["scenario"] == "hangover"
 
         # Вася — все шаги по инструкции, характеристики вручную
@@ -320,8 +322,40 @@ def test_full_scenario(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_vote():
+    from dnd.gm import Mechanics
+
+    async def scenario():
+        h = Harness(os.path.join(tempfile.mkdtemp(), 'dnd.sqlite3'))
+        await h.start()
+        await h.say(VASYA, '/newgame тестовый мир')
+        for user, name in ((VASYA, 'Торин'), (PETYA, 'Лиса')):
+            await h.say(user, f'/join {name}')
+            await h.click(user, f'cls:{user.id}:random')
+            await h.say(user, '-')
+            await h.say(user, '-')
+        await h.say(VASYA, '/go')
+        result = await Mechanics(h.state).tool_propose_vote('Куда идём?', ['В лес', 'В город'])
+        assert result['ok']
+        vote_id = h.state['vote']['id']
+        await h.click(KOLYA, f'vote:{vote_id}:1')
+        assert not h.state['vote']['votes']
+        await h.click(VASYA, f'vote:{vote_id}:0')
+        await h.click(VASYA, f'vote:{vote_id}:1')
+        assert h.state['vote']['votes'] == {'11': 0}
+        await h.click(PETYA, f'vote:{vote_id}:0')
+        assert h.state['vote'] is None
+        assert 'Выбрано: В лес' in h.last(2)
+        assert 'В лес' in h.state['history'][-1]['actions']
+        await h.click(PETYA, f'vote:{vote_id}:1')
+        assert h.state['vote'] is None
+        await h.dnd.storage.close()
+
+    asyncio.run(scenario())
+
+
 def test_scenarios():
-    assert len(SCENARIOS) == 11
+    assert len(SCENARIOS) == 14
     levels = {sc.get("level") for sc in SCENARIOS.values()}
     assert {"1–2", "2–3", "3–4", "4–5", "6–8", "9–11", "12–15", "16–20"} <= levels
     for key, sc in SCENARIOS.items():
@@ -471,6 +505,8 @@ def test_topics():
         await h.say(VASYA, "/newgame", GAME)
         assert h.session.threads[-1] == GAME  # ответ на команду — в тот же топик
         await h.click(VASYA, "ng:heist", GAME)
+        assert CHAT_ID not in h.dnd.states
+        await h.click(VASYA, "startsc:heist", GAME)
         assert h.state["thread_id"] == GAME and h.session.threads[-1] == GAME
 
         # Из чужого топика команды и заявки не работают

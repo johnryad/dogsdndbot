@@ -35,9 +35,18 @@ SYSTEM_PROMPT = """Ты — ведущий (Мастер) партии Dungeons 
 - В бою описывай только тех, кто указан в блоке «Ход»: действие текущего персонажа и затем ходы перечисленных монстров (каждый монстр атакует через attack). Не отыгрывай ходы других персонажей.
 - Объём: 500–1200 знаков, без вступлений вроде «Отлично!». Можно **жирный** для имён и важного. Без списков и заголовков — это рассказ.
 - Вне боя заканчивай ситуацией, на которую игроки могут реагировать.
+- Если игроки предлагают несовместимые групповые решения и выбор важен, сначала вызови propose_vote с вопросом и 2–4 ясными вариантами. Не разыгрывай решение до голосования и не вызывай другие меняющие состояние инструменты в этом ходе. Не голосуй за индивидуальные действия персонажей.
 """
 
 TOOLS = [
+    {
+        "name": "propose_vote",
+        "description": "Предложить голосование по спорному общему решению вне боя; не разыгрывай исход до голосования.",
+        "parameters": {"type": "OBJECT", "properties": {
+            "question": {"type": "STRING"},
+            "options": {"type": "ARRAY", "items": {"type": "STRING"}},
+        }, "required": ["question", "options"]},
+    },
     {
         "name": "roll_dice",
         "description": "Бросить кубики по формуле (например 2d6+3, 1d20, 8d6). Для урона по площади, случайных таблиц и т.п.",
@@ -240,6 +249,20 @@ class Mechanics:
         except Exception as e:
             logging.exception(f"ДнД: инструмент {name} упал")
             return {"error": f"инструмент сломался: {e}"}
+
+    async def tool_propose_vote(self, question, options):
+        if self.state.get("combat") or self.state.get("vote") or self.state.get("status") != "active":
+            return {"error": "Голосование сейчас недоступно"}
+        if not isinstance(question, str) or not isinstance(options, list):
+            return {"error": "Нужны вопрос и список вариантов"}
+        choices = [s.strip()[:100] for s in options if isinstance(s, str) and s.strip()]
+        voters = [k for k, c in characters(self.state).items() if can_act(c)]
+        if not question.strip() or not 2 <= len(choices) <= 4 or len(set(choices)) != len(choices) or len(voters) < 2:
+            return {"error": "Нужны 2–4 разных варианта и хотя бы два активных игрока"}
+        import secrets
+        self.state["vote"] = {"id": secrets.token_hex(5), "question": question.strip()[:300],
+                              "options": choices, "voters": voters, "votes": {}}
+        return {"ok": True, "message": "Голосование открыто; дождись результата, не разыгрывай выбор"}
 
     async def tool_roll_dice(self, expression, reason="", advantage="none"):
         r = roll(expression, advantage)
@@ -750,7 +773,7 @@ class GameMaster:
         contents = history_contents(state) + [{"role": "user", "parts": [{"text": prompt}]}]
         texts: list[str] = []
         for step in range(MAX_TOOL_STEPS):
-            tools = TOOLS if use_tools and step < MAX_TOOL_STEPS - 1 else None
+            tools = TOOLS if use_tools and not state.get('vote') and step < MAX_TOOL_STEPS - 1 else None
             content = await self.llm.generate(SYSTEM_PROMPT, contents, tools)
             contents.append(content)
             calls = [p["functionCall"] for p in content["parts"] if "functionCall" in p]
@@ -758,8 +781,12 @@ class GameMaster:
             if not calls:
                 break
             responses = []
+            voting = any(call['name'] == 'propose_vote' for call in calls)
             for call in calls:
-                result = await mech.call(call["name"], call.get("args") or {})
+                if voting and call['name'] != 'propose_vote':
+                    result = {'error': 'Действие отложено до голосования'}
+                else:
+                    result = await mech.call(call["name"], call.get("args") or {})
                 logging.info(f"ДнД tool {call['name']}({call.get('args')}) → {result}")
                 response = {"name": call["name"], "response": result}
                 if call.get("id"):
