@@ -669,7 +669,7 @@ class DndBot:
     async def cmd_help(self, message: Message):
         await message.answer(HELP, parse_mode="HTML")
 
-            async def cmd_ask(self, message: Message, command: CommandObject):
+    async def cmd_ask(self, message: Message, command: CommandObject):
         question = (command.args or "").strip()
         if not question:
             await message.answer("Напиши вопрос после команды, например: <code>/ask как работают спасброски от смерти?</code>", parse_mode="HTML")
