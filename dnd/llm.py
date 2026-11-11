@@ -1,4 +1,4 @@
-"""Клиент Gemini через REST (без SDK — меньше зависимостей и памяти на Render)."""
+"""Клиент Gemini через REST (без SDK — меньше зависимостей и памяти н/а Render)."""
 import os
 import time
 import base64
