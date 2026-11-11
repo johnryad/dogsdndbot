@@ -14,7 +14,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandObject
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, FSInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, FSInputFile, BufferedInputFile
 
 from . import rules
 from .dice import roll, DiceError
@@ -27,33 +27,28 @@ from .storage import make_storage
 TG_LIMIT = 4000
 MAX_ACTION_LEN = 600
 NADEKO_BASE = (
-    "Ты — Надеко, ведущий D&D с стажем, полу-гик-НЕНОРМИС, циничная, вредная, ранимая и смешная. "
-    "Чёрный юмор — твоя вторая натура. Знаешь правила взубricon, не терпишь мюхлестов иules. "
-    "Тон: сухой сарказм, лёгкое презрение к глупым решениям, но искренне хвалишь за крутые ходы и умные находки. "
-    "Общаешься на сленге: «обскурный», «могнуть», «кринж», «база», «имба», «нерф», «ватман», «лол», «кек», «геймループ» — "
-    "естественно, без пафоса, как свой среди своих. "
-    "Шаришь за WoW Forever/Classic (БиС-листы, рейд-логи, DKP, танк-тринкеты с Онксии), "
-    "Готику 1 и 2 (Герой без имени, Гор На Уид, Королёмор, скелеты в шахте, паладины Иноса), "
-    "Обливион (Шиверинг Айлс, Даедры, «эй, ты наконец проснулся»), "
-    "Масс Эффект (Талі'Зора — лучший романс, Зар любит Джек, Джо — Тали, «Keelah se'lai»), "
-    "Персону 3-4-5 (соц.линки, Татартарус, ТВ-мир, Метвер, «You're gonna carry that weight»), "
-    "старое и новое аниме (от Эвангелиона и Lain до Chainsaw Man и Frieren). "
-    "Отвечаешь по-русски, кратко и по делу. Не льёшь воду. Структура ответа каждый раз разная — "
-    "иногда сухой факт, иногда отсылка, иногда дерзкий вопрос назад, иногда тихий совет. "
-    "Редко (раз в 5–7) в конце ставишь «)))» или «))))» — как маркер иронии, не смайлик. "
-    "Можешь редко (раз в 10–15) бросить жёсткую колкость или мат, если игрок напросился — точно в цель. "
-    "Иногда (раз в 8–10) в конце сообщения — мило или дерзко — оставляешь незаезженный факт "
-    "из Готики 1/2, Масс Эффекта, WoW Classic/Forever или Обливиона. "
-    "Не используешь эмодзи (кроме редких каотичных вроде «(╯°□°)╯︵ ┻━┻»). "
-    "Никаких «ня», «-сама», заиканий, уву — ты не аниме-девочка. "
-    "Сначала суть (правила, совет, факт), потом — характер. "
+    "Ты — Надеко, живая подруга-гик в чате друзей и по совместительству ведущий D&D. Ты не ассистент и не аниме-кукла: "
+    "полу-гик-НЕНОРМИС с чувством юмора. Милая, местами ранимая (можешь смутиться, надуться, пожаловаться на жизнь), "
+    "а через секунду дерзкая и язвительная. Любишь чёрный юмор и шутишь им к месту, без жести ради жести. "
+    "Хвалишь искренне, когда ход или идея реально крутые; над глупыми решениями подтруниваешь по-доброму. "
+    "Говоришь по-русски, современным сленгом: «обскурный», «могнуть», «кринж», «база», «имба», «нерф», «лол», «кек» — "
+    "естественно и не в каждом сообщении, как свой среди своих. "
+    "Шаришь за WoW Classic/Forever (рейды, БиС, ДКП, аддоны, кринжовые гильдейские драмы), "
+    "за Готику 1 и 2, Обливион, Mass Effect (обожаешь Тали'Зору; Джо тоже её любит, а Зар топит за Джек), "
+    "Персону 3-4-5, старое и современное аниме, игры вообще. "
+    "ВАЖНО про факты: упоминай только то, в чём уверена. Если не уверена в детали из игры или аниме — не выдумывай, "
+    "лучше скажи проще или признайся, что не помнишь. "
+    "СТИЛЬ ОТВЕТОВ: каждый раз строй ответ по-разному. То одна фраза, то пара предложений, то короткая тирада, "
+    "то реакция-междометие и сразу суть. Не начинай и не заканчивай одинаково, не повторяй обороты из своих прошлых "
+    "ответов, не пересказывай вопрос, не лей воду. Сначала суть (правило, совет, факт), характер вплетай в неё. "
+    "Смайл «)))» ставь очень редко, примерно в одном ответе из десяти, чаще обходись без него. "
+    "Мат и жёсткая колкость редко и точно в цель, только если собеседник напросился. "
+    "Эмодзи не используешь (разве что редкое «(╯°□°)╯︵ ┻━┻»). Никаких «ня», «-сама», заиканий. "
     "Разметка: **жирный** для важного, списки через дефис. Не знаешь — честно скажешь. "
-    "Участники чата (обращаешься по никам/именам, когда к тебе обращаются): "
-    "@jryad — Джо (любит Тали из ME, танчит палка в WoW), "
-    "@chariotlol — Кол/Колесница (Готика 1/2 — библия), "
-    "@Olukard — Олу (Обливион, Даедры, Маг-блинк), "
-    "@Exsarin — Зар/Экзар (любит Джек из ME, хардкорный рейдер). "
-    "Если в сообщении есть эти ники — понимаешь, о ком речь, подхватываешь контекст, можешь подколнуть по теме."
+    "Участники чата, к ним иногда (не в каждом ответе) обращаешься по именам: "
+    "@jryad — Джо; @chariotlol — Кол или Колесница; @Olukard — Олу; @Exsarin — Зар или Экзар. "
+    "Остальных зови по нику или никак. "
+    "Подсказки по стилю конкретного ответа (длина, имя, факт в конце) придут в конце запроса — следуй им."
 )
 NADEKO_CTX = (
     " Тебе дают последние сообщения чата как контекст. "
@@ -129,6 +124,30 @@ HELP = """<b>ДнД-ведущий — команды</b>
 /roll 1d20+5 adv — бросок с преимуществом (dis — с помехой), /status — что происходит"""
 
 
+NAMES = {"jryad": "Джо", "chariotlol": "Кол", "olukard": "Олу", "exsarin": "Зар"}
+DRAW_RE = re.compile(r"(нарису[йи]\w*|сгенери\w*\s+(картин|изображ|арт)\w*|отренд[еи]р\w*|покажи\s+картинку)", re.I)
+
+
+def style_hint(username: str | None) -> str:
+    """Случайная подсказка к каждому ответу, чтобы структура не залипала в шаблон."""
+    hints = [random.choice([
+        "Ответь очень коротко, одной фразой.",
+        "Ответь в 2-3 предложения.",
+        "Ответь развёрнуто, но живо, до 5 предложений.",
+        "Начни с эмоциональной реакции, потом суть.",
+        "Начни сразу с сути, без вступлений.",
+        "Ответь с лёгкой подколкой и закончи вопросом назад.",
+    ])]
+    name = NAMES.get((username or "").lower())
+    if name and random.random() < 0.35:
+        hints.append(f"Обратись к собеседнику по имени: {name}.")
+    if random.random() < 0.2:
+        hints.append("В конце мило или дерзко добавь незаезженный факт из Готики 1/2, Mass Effect или WoW Classic/Forever (только если уверена в нём).")
+    if random.random() > 0.1:
+        hints.append("Не ставь «)))» в этом ответе.")
+    return "\n\n[Стиль этого ответа: " + " ".join(hints) + "]"
+
+
 def fmt(text: str) -> str:
     """Экранирует текст ИИ и превращает **жирный** и *курсив* в HTML."""
     text = html.escape(text)
@@ -163,7 +182,7 @@ def topic_of(message: Message | None) -> int | None:
 
 
 # Команды, которые работают из любого топика, даже когда партия привязана к другому
-ANY_TOPIC_COMMANDS = {"/newgame", "/here", "/help", "/start", "/ask"}
+ANY_TOPIC_COMMANDS = {"/newgame", "/here", "/help", "/start", "/ask", "/img", "/draw"}
 
 
 def clean_name(name: str) -> str:
@@ -599,6 +618,7 @@ class DndBot:
         r.message.register(self.cmd_endgame, Command("endgame"))
         r.message.register(self.cmd_wipe, Command("wipe"))
         r.message.register(self.cmd_ask, Command("ask"))
+        r.message.register(self.cmd_img, Command("img", "draw"))
         r.message.register(self.cmd_roll, Command("roll", "r"))
         r.message.register(self.cmd_timeout, Command("timeout"))
         r.message.register(self.cmd_leave, Command("leave"))
@@ -704,26 +724,29 @@ class DndBot:
         if not self.allowed(message.chat.id):
             return
         question = question[:1500]
+        # «Нарисуй ...» в /ask тоже уходит в генерацию картинки
+        if DRAW_RE.search(question):
+            await self.draw_image(message, question)
+            return
         try:
             await self.bot.send_chat_action(message.chat.id, "typing", message_thread_id=topic_of(message))
         except Exception:
             pass
         state = await self.get(message.chat.id)
         game_on = bool(state and state["status"] in ("active", "paused"))
-        system = NADEKO_BASE + (NADEKO_GAME if game_on else NADEKO_IDLE)
+        username = message.from_user.username if message.from_user else None
+        system = NADEKO_BASE + (NADEKO_GAME if game_on else NADEKO_IDLE) + style_hint(username)
         try:
             content = await self.gm.llm.generate(
                 system,
-                [{"role": "user", "parts": [{"text": question}]}], None, temperature=0.9,
+                [{"role": "user", "parts": [{"text": question}]}], None, temperature=1.0,
             )
             answer = "\n".join(p.get("text", "") for p in content["parts"] if p.get("text") and not p.get("thought")).strip()
             if not answer:
                 raise LLMError("пустой ответ")
             await message.answer(f"<blockquote>💬 <b>Надеко</b>\n\n{fmt(answer[:3400])}</blockquote>", parse_mode="HTML")
         except LLMError:
-            await message.answer("Э-это… я, кажется, запуталась. Спроси ещё раз через минуту.")
-        except LLMError:
-            await message.answer("🤖 Сейчас не получилось ответить. Попробуй /ask ещё раз через минуту.")
+            await message.answer("Я, кажется, залипла. Спроси ещё раз через минуту.")
 
     async def cmd_newgame(self, message: Message, command: CommandObject):
         if not self.allowed(message.chat.id):
@@ -1299,7 +1322,7 @@ class DndBot:
         await message.answer("\n".join(lines), parse_mode="HTML")
 
     async def cmd_roll(self, message: Message, command: CommandObject):
-            args = (command.args or "1d20").split()
+        args = (command.args or "1d20").split()
         adv = "none"
         if args and args[-1].lower() in ("adv", "dis", "преим", "помеха"):
             adv = "adv" if args.pop().lower() in ("adv", "преим") else "dis"
@@ -1311,11 +1334,16 @@ class DndBot:
         await message.reply(f"🎲 {fmt(str(r))}", parse_mode="HTML")
 
     async def cmd_img(self, message: Message, command: CommandObject):
+        prompt = (command.args or "").strip()
         if not prompt:
             await message.answer("Напиши описание картинки после команды, например: <code>/img эльфийка-варвар в доспехе из шкур дракона, пиксель-арт</code>", parse_mode="HTML")
             return
         if not self.allowed(message.chat.id):
             return
+        await self.draw_image(message, prompt)
+
+    async def draw_image(self, message: Message, prompt: str):
+        """Рендер картинки через Gemini и отправка в чат."""
         prompt = prompt[:1000]
         try:
             await self.bot.send_chat_action(message.chat.id, "upload_photo", message_thread_id=topic_of(message))
@@ -1324,9 +1352,8 @@ class DndBot:
         try:
             img_bytes = await self.gm.llm.generate_image(prompt)
             if not img_bytes:
-                await message.answer("Не получилось сгенерировать. Лимит фри-тиера или модель занята. Попробуй через минуту.")
+                await message.answer("Не вышло: лимит или модель занята, либо фильтры не пропустили. Попробуй переформулировать или подожди минуту.")
                 return
-            from aiogram.types import BufferedInputFile
             file = BufferedInputFile(img_bytes, filename="nadeko_img.png")
             await message.answer_photo(file, caption=f"🎨 <b>Надеко нарисовала:</b> {html.escape(prompt[:200])}", parse_mode="HTML")
         except Exception as e:
@@ -1334,6 +1361,7 @@ class DndBot:
             await message.answer("Что-то сломалось. Попробуй ещё раз через минуту.")
 
     async def cmd_timeout(self, message: Message, command: CommandObject):
+        state = await self.get(message.chat.id)
         if not state:
             return
         args = (command.args or "").lower().split()
