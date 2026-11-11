@@ -1,10 +1,14 @@
 """Клиент Gemini через REST (без SDK — меньше зависимостей и памяти на Render)."""
+import os
 import time
+import base64
 import asyncio
 import logging
 import aiohttp
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+# Модели для картинок; можно переопределить переменной GEMINI_IMAGE_MODELS (через запятую)
+IMAGE_MODELS = [m.strip() for m in os.getenv("GEMINI_IMAGE_MODELS", "gemini-2.5-flash-image").split(",") if m.strip()]
 
 
 class LLMError(Exception):
@@ -112,3 +116,35 @@ class GeminiClient:
                     # Этот уровень размышлений модель не поддерживает — на следующем круге пойдёт без него
                     self.no_thinking.add(model)
         raise LLMError(last_error)
+
+    async def generate_image(self, prompt: str) -> bytes | None:
+        """Рендерит картинку по описанию. Возвращает байты PNG/JPEG или None, если не вышло."""
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"responseModalities": ["IMAGE", "TEXT"]},
+        }
+        timeout = aiohttp.ClientTimeout(total=90)
+        for model in IMAGE_MODELS:
+            await self.limiter.wait()
+            self.calls += 1
+            try:
+                async with aiohttp.ClientSession(timeout=timeout) as session:
+                    async with session.post(
+                        API_URL.format(model=model), json=body, headers={"x-goog-api-key": self.api_key}
+                    ) as resp:
+                        data = await resp.json(content_type=None)
+                        status = resp.status
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                logging.warning(f"Gemini image {model}: сеть: {e!r}")
+                continue
+            if status != 200:
+                message = (data or {}).get("error", {}).get("message", "")[:300]
+                logging.warning(f"Gemini image {model}: HTTP {status}: {message}")
+                continue
+            for cand in data.get("candidates") or []:
+                for part in (cand.get("content") or {}).get("parts") or []:
+                    inline = part.get("inlineData") or part.get("inline_data")
+                    if inline and inline.get("data"):
+                        return base64.b64decode(inline["data"])
+            logging.warning(f"Gemini image {model}: в ответе нет картинки: {str(data)[:300]}")
+        return None
